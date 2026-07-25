@@ -1,0 +1,10 @@
+# YouTube Downloader — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+yt-dlp>=2024.1.0     # YouTube download engine (keep updated!)
+PyQt5>=5.15.0        # Desktop GUI (for youtube_downloader.py)
+
+# Also required (system packages — NOT pip):
+#   ffmpeg  →  sudo apt install ffmpeg   (Linux)
+#              brew install ffmpeg       (macOS)
+#              https://ffmpeg.org/download.html (Windows)

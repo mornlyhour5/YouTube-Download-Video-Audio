@@ -1,0 +1,20 @@
+# Secrets
+cookies.txt
+
+# PyInstaller
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
