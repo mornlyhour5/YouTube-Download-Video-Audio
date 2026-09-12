@@ -155,8 +155,15 @@ def _strip_ansi(text):
         return ""
     return _ANSI_ESCAPE_RE.sub("", str(text)).strip()
 
-
-# ── Workers ────────────────────────────────────────────────────────────────────
+_RETRY_OPTS = {
+    "retries": 5,
+    "fragment_retries": 5,
+    "extractor_retries": 3,
+    "socket_timeout": 15,
+}
+_EXTRACTOR_ARGS = {
+    "youtube": {"player_client": ["tv", "web", "android"]},
+}
 
 class DownloadWorker(QThread):
     progress   = pyqtSignal(float, str)
@@ -206,11 +213,12 @@ class DownloadWorker(QThread):
             self.processing.emit()
 
     def _base_opts(self):
-        """Common options that fix 403 errors: spoofed headers + browser cookies."""
         opts = {
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
+            **_RETRY_OPTS,
+            "extractor_args": _EXTRACTOR_ARGS,
             # Mimic a real browser so YouTube does not block the request
             "http_headers": {
                 "User-Agent": (
@@ -342,6 +350,8 @@ class InfoWorker(QThread):
                 "no_warnings": True,
                 "skip_download": True,
                 "noplaylist": True,
+                **_RETRY_OPTS,
+                "extractor_args": _EXTRACTOR_ARGS,
                 "http_headers": {
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
