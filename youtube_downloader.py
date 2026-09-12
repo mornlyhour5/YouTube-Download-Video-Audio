@@ -155,15 +155,28 @@ def _strip_ansi(text):
         return ""
     return _ANSI_ESCAPE_RE.sub("", str(text)).strip()
 
+
+# ── Shared yt-dlp network/retry options ─────────────────────────────────────────
+# YouTube periodically blocks specific player clients. These options provide
+# multiple fallback clients and aggressive retries to work around temporary blocks.
+
 _RETRY_OPTS = {
-    "retries": 5,
-    "fragment_retries": 5,
-    "extractor_retries": 3,
-    "socket_timeout": 15,
+    "retries": 15,
+    "fragment_retries": 15,
+    "extractor_retries": 7,
+    "socket_timeout": 30,
+    "http_chunk_size": 10485760,
 }
+
 _EXTRACTOR_ARGS = {
-    "youtube": {"player_client": ["tv", "web", "android"]},
+    "youtube": {
+        "player_client": ["web_embedded", "web", "android", "tv"],
+        "player_skip": ["configs", "js"],
+    },
 }
+
+
+# ── Workers ────────────────────────────────────────────────────────────────────
 
 class DownloadWorker(QThread):
     progress   = pyqtSignal(float, str)
@@ -217,6 +230,7 @@ class DownloadWorker(QThread):
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
+            "allow_unplayable_formats": False,
             **_RETRY_OPTS,
             "extractor_args": _EXTRACTOR_ARGS,
             # Mimic a real browser so YouTube does not block the request
@@ -224,18 +238,24 @@ class DownloadWorker(QThread):
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
+                    "Chrome/131.0.0.0 Safari/537.36"
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": "https://www.youtube.com/",
+                "Accept-Encoding": "gzip, deflate",
+                "DNT": "1",
+                "Sec-CH-UA": '"Not_A_Brand";v="8", "Chromium";v="131"',
+                "Sec-CH-UA-Mobile": "?0",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
             },
-            # Use exported cookie file if present (avoids DPAPI Chrome issue)
-            **self._cookie_opts(),
         }
         return opts
 
     def _cookie_opts(self):
+        # Only use cookies if they exist; don't fail without them
         cookie_file = resource_path("cookies.txt")
         if os.path.exists(cookie_file):
             return {"cookiefile": cookie_file}
@@ -245,6 +265,7 @@ class DownloadWorker(QThread):
         try:
             outtmpl = os.path.join(self.output_dir, "%(title)s.%(ext)s")
             base = self._base_opts()
+            base.update(self._cookie_opts())
 
             if self.mode == "mp3":
                 ydl_opts = {
@@ -356,10 +377,13 @@ class InfoWorker(QThread):
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
+                        "Chrome/131.0.0.0 Safari/537.36"
                     ),
                     "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Referer": "https://www.youtube.com/",
+                    "Accept-Encoding": "gzip, deflate",
+                    "DNT": "1",
                 },
                 **self._cookie_opts(),
             }
@@ -410,7 +434,7 @@ class ThumbnailWorker(QThread):
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
+                        "Chrome/131.0.0.0 Safari/537.36"
                     ),
                     "Referer": "https://www.youtube.com/",
                 },
@@ -1122,7 +1146,7 @@ class YouTubeDownloader(QMainWindow):
         sb_lay = QHBoxLayout(status_bar)
         sb_lay.setContentsMargins(16, 8, 16, 8)
 
-        self.ver_lbl = QLabel("version 1.3.1")
+        self.ver_lbl = QLabel("version 1.3.0")
         self.ver_lbl.setObjectName("footer")
         self.ver_lbl.setFont(QFont("Segoe UI", 9))
         sb_lay.addWidget(self.ver_lbl)
@@ -1800,16 +1824,19 @@ class YouTubeDownloader(QMainWindow):
             return
         for entry in history:
             kind_icon = "🎵" if "Audio" in entry.get("type", "") else "🎬"
-            list_item = QListWidgetItem(
+            folder = entry.get("folder", "")
+            display_text = (
                 f"{kind_icon}  {entry.get('title', 'Unknown')}\n"
                 f"     {entry.get('type', '')} • {entry.get('timestamp', '')}\n"
-                f"     {entry.get('folder', '')}"
+                f"     {folder}"
             )
-            list_item.setData(Qt.UserRole, entry.get("folder", ""))
-            list_item.setToolTip("Double-click to open this folder")
+            list_item = QListWidgetItem(display_text)
+            list_item.setData(Qt.UserRole, folder)
+            list_item.setToolTip("Double-click to open folder")
             self.history_list.addItem(list_item)
 
     def _open_history_item_folder(self, list_item):
+        """Open folder when item is double-clicked"""
         folder = list_item.data(Qt.UserRole)
         if folder:
             self._open_in_explorer(folder)
