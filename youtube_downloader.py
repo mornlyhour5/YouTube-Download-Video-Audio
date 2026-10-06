@@ -7,14 +7,18 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QProgressBar, QComboBox,
-    QFileDialog, QFrame, QTextEdit, QCheckBox, QStyle,
+    QFileDialog, QFrame, QCheckBox,
     QSizePolicy, QScrollArea, QDialog, QRadioButton, QButtonGroup,
-    QMessageBox, QPlainTextEdit, QListWidget, QListWidgetItem, QTabWidget
+    QMessageBox, QListWidget, QListWidgetItem
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QSettings
-from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QPixmap, QPainter, QPainterPath, QBrush
+from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter, QPainterPath
 import urllib.request
+import urllib.parse as urlparse
 import yt_dlp
+
+# New professional theme, vector icons and stylesheets live in ui_style.py
+from ui_style import THEMES, make_icon, build_main_qss, build_dialog_qss
 
 
 def resource_path(filename):
@@ -24,13 +28,28 @@ def resource_path(filename):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
-# ── Persistent settings (stored forever via QSettings — survives app restarts) ──
-# On Windows this lives in the registry, on macOS in ~/Library/Preferences,
-# on Linux in ~/.config. No extra file to manage, and it's automatic.
+# ── Quality options ──────────────────────────────────────────────────────────
+
+APP_VERSION = "1.4.0"
+
+QUALITY_KEYS = ["best4k", "1080p", "720p", "480p", "360p", "audio_only"]
+
+QUALITY_TO_YTDLP = {
+    "best4k": "best", "1080p": "1080", "720p": "720",
+    "480p": "480", "360p": "360", "audio_only": "best",
+}
+
+_LEGACY_QUALITY_MAP = {
+    "Best (4K)": "best4k", "1080p": "1080p", "720p": "720p",
+    "480p": "480p", "360p": "360p", "Audio Only": "audio_only",
+}
+
+
+# ── Persistent settings ───────────────────────────────────────────────────────
 
 class AppSettings:
-    ORG  = "ProYTTools"
-    APP  = "YouTubeDownloader"
+    ORG = "ProYTTools"
+    APP = "YouTubeDownloader"
 
     def __init__(self):
         self._s = QSettings(self.ORG, self.APP)
@@ -60,7 +79,8 @@ class AppSettings:
         self._s.sync()
 
     def get_default_quality(self):
-        return self._s.value("prefs/default_quality", "Best (4K)")
+        raw = self._s.value("prefs/default_quality", "best4k")
+        return _LEGACY_QUALITY_MAP.get(raw, raw if raw in QUALITY_KEYS else "best4k")
 
     def set_default_quality(self, val):
         self._s.setValue("prefs/default_quality", val)
@@ -80,7 +100,23 @@ class AppSettings:
         self._s.setValue("prefs/default_format", val)
         self._s.sync()
 
-    # ── Download history (JSON file, kept forever until cleared) ──────────
+    def get_theme(self):
+        val = self._s.value("prefs/theme", "dark")
+        return val if val in ("dark", "light") else "dark"
+
+    def set_theme(self, val):
+        self._s.setValue("prefs/theme", val)
+        self._s.sync()
+
+    def get_language(self):
+        val = self._s.value("prefs/language", "en")
+        return val if val in ("en", "km") else "en"
+
+    def set_language(self, val):
+        self._s.setValue("prefs/language", val)
+        self._s.sync()
+
+    # ── Download history ──────────────────────────────────────────────────
 
     def _history_path(self):
         base = os.path.join(os.path.expanduser("~"), ".pro_yt_downloader")
@@ -99,8 +135,8 @@ class AppSettings:
 
     def add_history_entry(self, entry):
         history = self.load_history()
-        history.insert(0, entry)   # newest first
-        history = history[:500]    # cap so the file never grows unbounded
+        history.insert(0, entry)
+        history = history[:500]
         try:
             with open(self._history_path(), "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
@@ -114,7 +150,7 @@ class AppSettings:
         except OSError:
             pass
 
-    # ── Pending queue (JSON file, survives app restarts) ──────────────────
+    # ── Pending queue ─────────────────────────────────────────────────────
 
     def _queue_path(self):
         base = os.path.join(os.path.expanduser("~"), ".pro_yt_downloader")
@@ -139,13 +175,8 @@ class AppSettings:
             pass
 
 
-# ── ANSI helpers ────────────────────────────────────────────────────────────────
-# yt-dlp's progress-hook strings (_percent_str, _speed_str, _eta_str) are
-# formatted for terminal display and can contain ANSI color escape codes
-# (e.g. "\x1b[0;32m 12.9%\x1b[0m"). Parsing those directly with float() throws,
-# which silently produced 0.0 every time and froze the UI progress bar even
-# though the terminal (which strips ANSI itself for TTY output) looked fine.
-# Always strip ANSI codes before doing anything numeric with these strings.
+# ── ANSI helpers ────────────────────────────────────────────────────────────
+# yt-dlp progress strings can contain ANSI color codes that break float().
 
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
@@ -156,9 +187,7 @@ def _strip_ansi(text):
     return _ANSI_ESCAPE_RE.sub("", str(text)).strip()
 
 
-# ── Shared yt-dlp network/retry options ─────────────────────────────────────────
-# YouTube periodically blocks specific player clients. These options provide
-# multiple fallback clients and aggressive retries to work around temporary blocks.
+# ── Shared yt-dlp network/retry options ─────────────────────────────────────
 
 _RETRY_OPTS = {
     "retries": 15,
@@ -174,6 +203,183 @@ _EXTRACTOR_ARGS = {
         "player_skip": ["configs", "js"],
     },
 }
+
+
+# ── Translations (English / Khmer) ──────────────────────────────────────────
+# Leading decorative symbols ("⚙  Settings") are stripped by tr(); the UI now
+# uses vector icons instead, so the plain text is what is displayed.
+
+TRANSLATIONS = {
+    "en": {
+        "paste_link": "Paste Link",
+        "video": "Video",
+        "audio": "Audio",
+        "quality_best": "Best (4K)",
+        "quality_audio_only": "Audio Only",
+        "subtitles": "Subtitles",
+        "settings": "Settings",
+        "settings_window_title": "Settings",
+        "version_label": "version {v}",
+        "download_all_ready": "Download All Ready",
+        "theme_tooltip": "Switch between dark and light theme",
+        "tab_all": "All", "tab_ready": "Ready", "tab_processing": "Processing",
+        "tab_failed": "Failed", "tab_skipped": "Skipped", "tab_complete": "Complete",
+        "empty_hint_youtube": 'No YouTube links yet — click "Paste Link" to add one.',
+        "empty_hint_meta": 'No Facebook or Instagram links yet — click "Paste Link" to add one.',
+        "empty_hint_tiktok": 'No TikTok links yet — click "Paste Link" to add one.',
+        "added_to_other_page": "Also added to: {pages}",
+        "history": "History",
+        "hide_history": "Hide History",
+        "status_queued": "Queued",
+        "status_loading": "Loading info…",
+        "status_ready": "Ready",
+        "status_processing": "Downloading…",
+        "status_complete": "Done",
+        "status_failed": "Failed",
+        "status_skipped": "Skipped",
+        "progress_processing": "Processing…",
+        "tooltip_download": "Download this item",
+        "tooltip_download_again": "Download again",
+        "tooltip_open_folder": "Open containing folder",
+        "tooltip_remove": "Remove from list",
+        "history_title": "Download History",
+        "history_clear": "Clear History",
+        "history_close": "Close",
+        "history_empty": "No downloads yet.",
+        "history_tooltip_open": "Double-click to open folder",
+        "history_type_audio": "Audio (MP3)",
+        "history_type_video": "Video",
+        "settings_title": "Preferences",
+        "settings_subtitle": "Choose where downloads are stored. Your choice is saved automatically.",
+        "appearance": "Appearance",
+        "theme_dark": "Dark theme",
+        "theme_light": "Light theme",
+        "language_section": "Language",
+        "storage_mode": "Storage Mode",
+        "storage_same": "Use one folder for everything",
+        "storage_split": "Use separate folders for Video and Audio",
+        "video_location": "Video Save Location",
+        "combined_location": "Save Location (Video & Audio)",
+        "audio_location": "Audio Save Location",
+        "browse": "Browse...",
+        "done": "Done",
+        "no_link_title": "No Link Found",
+        "no_link_text": 'Copy a YouTube, Facebook, Instagram or TikTok link to your clipboard first, then click "Paste Link".',
+        "already_in_list": "That link is already in your list.",
+        "already_downloaded_title": "Already Downloaded",
+        "already_downloaded_audio_text": "This audio already exists in your download folder:",
+        "already_downloaded_video_text": "This video already exists in your download folder:",
+        "and_more": "…and {n} more",
+        "confirm_download_again": "Download it again?",
+        "btn_download_again": "Download Again",
+        "btn_skip": "Skip",
+        "folder_not_found_title": "Folder Not Found",
+        "folder_not_found_text": "That download folder no longer exists.",
+        "couldnt_open_folder_title": "Couldn't Open Folder",
+        "couldnt_open_folder_text": "Could not open the folder:\n{e}",
+        "select_video_folder": "Select Video Folder",
+        "select_audio_folder": "Select Audio Folder",
+        "playlist_title": "Playlist Detected",
+        "playlist_text": "This link is part of a playlist or Mix.\n\nAdd every video (up to {n}) or only this one?",
+        "playlist_add_all": "Add All Videos",
+        "playlist_add_one": "Just This Video",
+        "btn_cancel": "Cancel",
+        "playlist_loading": "Loading playlist…",
+        "playlist_added": "Added {n} videos from the playlist",
+        "playlist_nothing_new": "All videos from that playlist are already in your list.",
+        "playlist_failed_title": "Couldn't Load Playlist",
+    },
+    "km": {
+        "paste_link": "បិទភ្ជាប់តំណ",
+        "video": "វីដេអូ",
+        "audio": "សំឡេង",
+        "quality_best": "ល្អបំផុត (4K)",
+        "quality_audio_only": "តែសំឡេងប៉ុណ្ណោះ",
+        "subtitles": "អក្សររត់",
+        "settings": "ការកំណត់",
+        "settings_window_title": "ការកំណត់",
+        "version_label": "កំណែ {v}",
+        "download_all_ready": "ទាញយកទាំងអស់ដែលរួចរាល់",
+        "theme_tooltip": "ប្តូររវាងរបៀបងងឹត និងរបៀបភ្លឺ",
+        "tab_all": "ទាំងអស់", "tab_ready": "រួចរាល់", "tab_processing": "កំពុងដំណើរការ",
+        "tab_failed": "បរាជ័យ", "tab_skipped": "រំលង", "tab_complete": "បញ្ចប់",
+        "empty_hint_youtube": 'មិនទាន់មានតំណ YouTube នៅឡើយទេ — ចុច "បិទភ្ជាប់តំណ" ដើម្បីបន្ថែម។',
+        "empty_hint_meta": 'មិនទាន់មានតំណ Facebook ឬ Instagram នៅឡើយទេ — ចុច "បិទភ្ជាប់តំណ" ដើម្បីបន្ថែម។',
+        "empty_hint_tiktok": 'មិនទាន់មានតំណ TikTok នៅឡើយទេ — ចុច "បិទភ្ជាប់តំណ" ដើម្បីបន្ថែម។',
+        "added_to_other_page": "ក៏បានបន្ថែមទៅក្នុង៖ {pages}",
+        "history": "ប្រវត្តិ",
+        "hide_history": "លាក់ប្រវត្តិ",
+        "status_queued": "ក្នុងជួរ",
+        "status_loading": "កំពុងផ្ទុកព័ត៌មាន…",
+        "status_ready": "រួចរាល់",
+        "status_processing": "កំពុងទាញយក…",
+        "status_complete": "បានបញ្ចប់",
+        "status_failed": "បរាជ័យ",
+        "status_skipped": "រំលង",
+        "progress_processing": "កំពុងដំណើរការ…",
+        "tooltip_download": "ទាញយកធាតុនេះ",
+        "tooltip_download_again": "ទាញយកម្តងទៀត",
+        "tooltip_open_folder": "បើកថតដែលមានឯកសារនេះ",
+        "tooltip_remove": "លុបចេញពីបញ្ជី",
+        "history_title": "ប្រវត្តិទាញយក",
+        "history_clear": "សម្អាតប្រវត្តិ",
+        "history_close": "បិទ",
+        "history_empty": "មិនទាន់មានការទាញយកនៅឡើយទេ។",
+        "history_tooltip_open": "ចុចពីរដងដើម្បីបើកថត",
+        "history_type_audio": "សំឡេង (MP3)",
+        "history_type_video": "វីដេអូ",
+        "settings_title": "ចំណូលចិត្ត",
+        "settings_subtitle": "ជ្រើសរើសកន្លែងរក្សាទុកការទាញយក។ ជម្រើសរបស់អ្នកនឹងត្រូវបានរក្សាទុកដោយស្វ័យប្រវត្តិ។",
+        "appearance": "រូបរាង",
+        "theme_dark": "រូបរាងងងឹត",
+        "theme_light": "រូបរាងភ្លឺ",
+        "language_section": "ភាសា",
+        "storage_mode": "របៀបផ្ទុក",
+        "storage_same": "ប្រើថតតែមួយសម្រាប់អ្វីៗទាំងអស់",
+        "storage_split": "ប្រើថតដាច់ដោយឡែកសម្រាប់វីដេអូ និងសំឡេង",
+        "video_location": "ទីតាំងរក្សាទុកវីដេអូ",
+        "combined_location": "ទីតាំងរក្សាទុក (វីដេអូ និងសំឡេង)",
+        "audio_location": "ទីតាំងរក្សាទុកសំឡេង",
+        "browse": "រកមើល...",
+        "done": "រួចរាល់",
+        "no_link_title": "រកមិនឃើញតំណ",
+        "no_link_text": 'ចម្លងតំណ YouTube, Facebook, Instagram ឬ TikTok ទៅក្ដារតម្បៀតខ្ទាស់របស់អ្នកជាមុនសិន រួចចុច "បិទភ្ជាប់តំណ"។',
+        "already_in_list": "តំណនោះមានរួចហើយនៅក្នុងបញ្ជីរបស់អ្នក។",
+        "already_downloaded_title": "បានទាញយករួចហើយ",
+        "already_downloaded_audio_text": "សំឡេងនេះមានរួចហើយនៅក្នុងថតទាញយករបស់អ្នក៖",
+        "already_downloaded_video_text": "វីដេអូនេះមានរួចហើយនៅក្នុងថតទាញយករបស់អ្នក៖",
+        "and_more": "…និងមានទៀត {n}",
+        "confirm_download_again": "តើចង់ទាញយកម្តងទៀតទេ?",
+        "btn_download_again": "ទាញយកម្តងទៀត",
+        "btn_skip": "រំលង",
+        "folder_not_found_title": "រកមិនឃើញថត",
+        "folder_not_found_text": "ថតទាញយកនោះលែងមានទៀតហើយ។",
+        "couldnt_open_folder_title": "មិនអាចបើកថតបានទេ",
+        "couldnt_open_folder_text": "មិនអាចបើកថតបានទេ៖\n{e}",
+        "select_video_folder": "ជ្រើសរើសថតវីដេអូ",
+        "select_audio_folder": "ជ្រើសរើសថតសំឡេង",
+        "playlist_title": "រកឃើញបញ្ជីចាក់",
+        "playlist_text": "តំណនេះជាផ្នែកមួយនៃបញ្ជីចាក់ ឬ Mix។\n\nបន្ថែមវីដេអូទាំងអស់ (រហូតដល់ {n}) ឬតែវីដេអូនេះ?",
+        "playlist_add_all": "បន្ថែមវីដេអូទាំងអស់",
+        "playlist_add_one": "តែវីដេអូនេះ",
+        "btn_cancel": "បោះបង់",
+        "playlist_loading": "កំពុងផ្ទុកបញ្ជីចាក់…",
+        "playlist_added": "បានបន្ថែមវីដេអូ {n} ពីបញ្ជីចាក់",
+        "playlist_nothing_new": "វីដេអូទាំងអស់ពីបញ្ជីចាក់នោះមានក្នុងបញ្ជីរបស់អ្នករួចហើយ។",
+        "playlist_failed_title": "មិនអាចផ្ទុកបញ្ជីចាក់បានទេ",
+    },
+}
+
+# Strips a leading decorative symbol + two spaces, e.g. "⚙  Settings" -> "Settings"
+_ICON_PREFIX_RE = re.compile(r'^[^\w\s]+\s{2}')
+
+
+def tr(lang, key, **kwargs):
+    """Look up a translated string, falling back to English."""
+    table = TRANSLATIONS.get(lang) or TRANSLATIONS["en"]
+    text = table.get(key, TRANSLATIONS["en"].get(key, key))
+    text = _ICON_PREFIX_RE.sub("", text)
+    return text.format(**kwargs) if kwargs else text
 
 
 # ── Workers ────────────────────────────────────────────────────────────────────
@@ -195,28 +401,22 @@ class DownloadWorker(QThread):
 
     def _hook(self, d):
         if d["status"] == "downloading":
-            # Prefer the raw numeric byte fields — they're never colorized,
-            # unlike _percent_str which can carry ANSI escape codes that
-            # break a plain float() parse and silently zero out progress.
             downloaded = d.get("downloaded_bytes") or 0
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
 
             if total:
                 pct_f = (downloaded / total) * 100.0
             else:
-                # Fallback: strip ANSI codes before parsing the string version
                 raw = _strip_ansi(d.get("_percent_str", "0%")).replace("%", "").strip()
                 try:
                     pct_f = float(raw)
                 except ValueError:
-                    # Keep the last known good value instead of collapsing to 0
                     pct_f = self._last_pct if self._last_pct >= 0 else 0.0
 
             speed = _strip_ansi(d.get("_speed_str", ""))
             eta   = _strip_ansi(d.get("_eta_str", ""))
             label = f"{speed}  ETA {eta}" if speed else ""
 
-            # Lower threshold so small legitimate steps aren't swallowed
             if abs(pct_f - self._last_pct) >= 0.1 or self._last_pct < 0:
                 self._last_pct = pct_f
                 self.progress.emit(pct_f, label)
@@ -226,14 +426,13 @@ class DownloadWorker(QThread):
             self.processing.emit()
 
     def _base_opts(self):
-        opts = {
+        return {
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
             "allow_unplayable_formats": False,
             **_RETRY_OPTS,
             "extractor_args": _EXTRACTOR_ARGS,
-            # Mimic a real browser so YouTube does not block the request
             "http_headers": {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -252,10 +451,8 @@ class DownloadWorker(QThread):
                 "Sec-Fetch-Site": "none",
             },
         }
-        return opts
 
     def _cookie_opts(self):
-        # Only use cookies if they exist; don't fail without them
         cookie_file = resource_path("cookies.txt")
         if os.path.exists(cookie_file):
             return {"cookiefile": cookie_file}
@@ -274,28 +471,14 @@ class DownloadWorker(QThread):
                     "outtmpl": outtmpl,
                     "progress_hooks": [self._hook],
                     "writethumbnail": True,
-                    # Order matters: extract audio FIRST, then add metadata, then embed art
                     "postprocessors": [
-                        {
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": "mp3",
-                            "preferredquality": "192",
-                        },
-                        {
-                            "key": "FFmpegMetadata",
-                            "add_metadata": True,
-                        },
-                        {
-                            "key": "EmbedThumbnail",
-                            "already_have_thumbnail": False,
-                        },
+                        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+                        {"key": "FFmpegMetadata", "add_metadata": True},
+                        {"key": "EmbedThumbnail", "already_have_thumbnail": False},
                     ],
-                    # Convert thumbnail to jpg first (png can cause embed failures)
                     "convert_thumbnails": "jpg",
                 }
             else:
-                # Always pair best video + best audio so ffmpeg can merge them.
-                # Fallback chain guarantees audio is never skipped.
                 if self.quality == "best":
                     fmt = (
                         "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
@@ -319,20 +502,9 @@ class DownloadWorker(QThread):
                     "prefer_ffmpeg": True,
                     "writethumbnail": True,
                     "postprocessors": [
-                        {
-                            "key": "FFmpegVideoRemuxer",
-                            "preferedformat": "mp4",
-                        },
-                        {
-                            # Embed thumbnail into mp4 container
-                            "key": "EmbedThumbnail",
-                            "already_have_thumbnail": False,
-                        },
-                        {
-                            # Embed video metadata (title, uploader, etc.)
-                            "key": "FFmpegMetadata",
-                            "add_metadata": True,
-                        },
+                        {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
+                        {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+                        {"key": "FFmpegMetadata", "add_metadata": True},
                     ],
                 }
                 if self.subtitles:
@@ -400,11 +572,8 @@ class InfoWorker(QThread):
 
     @staticmethod
     def _best_thumb_url(info):
-        """Pick a small-ish thumbnail (fast to fetch) if yt-dlp gives a list,
-        otherwise fall back to the single 'thumbnail' field."""
         thumbs = info.get("thumbnails") or []
         if thumbs:
-            # Prefer something close to 96px wide so the row loads snappily
             sized = [t for t in thumbs if t.get("width")]
             if sized:
                 sized.sort(key=lambda t: abs(t["width"] - 96))
@@ -413,10 +582,74 @@ class InfoWorker(QThread):
         return info.get("thumbnail")
 
 
+MAX_PLAYLIST_ITEMS = 50   # safety cap; YouTube Mixes are practically endless
+
+
+class PlaylistWorker(QThread):
+    """Expands a playlist / Mix link into a list of single-video entries
+    (flat extraction: fast, nothing is downloaded)."""
+    entries_ready = pyqtSignal(list)
+    error         = pyqtSignal(str)
+
+    def __init__(self, url, limit=MAX_PLAYLIST_ITEMS):
+        super().__init__()
+        self.url   = url
+        self.limit = limit
+
+    def run(self):
+        try:
+            cookie_file = resource_path("cookies.txt")
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "extract_flat": "in_playlist",
+                "noplaylist": False,
+                "playlistend": self.limit,
+                **_RETRY_OPTS,
+                "extractor_args": _EXTRACTOR_ARGS,
+                "http_headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            }
+            if os.path.exists(cookie_file):
+                opts["cookiefile"] = cookie_file
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+
+            entries = []
+            for e in (info.get("entries") or []):
+                if not e:
+                    continue
+                url = e.get("url") or ""
+                if not url.startswith("http"):
+                    vid = e.get("id")
+                    if not vid:
+                        continue
+                    url = f"https://www.youtube.com/watch?v={vid}"
+                entries.append({
+                    "url": url,
+                    "title": e.get("title") or url,
+                    "channel": e.get("uploader") or e.get("channel") or "",
+                })
+                if len(entries) >= self.limit:
+                    break
+            if not entries:
+                raise ValueError("No videos were found in this playlist.")
+            self.entries_ready.emit(entries)
+        except Exception as ex:
+            self.error.emit(str(ex))
+
+
 class ThumbnailWorker(QThread):
     """Downloads a thumbnail image off the UI thread."""
-    thumb_ready = pyqtSignal(int, QPixmap)   # item_id, pixmap
-    failed      = pyqtSignal(int, str)       # item_id, error message
+    thumb_ready = pyqtSignal(int, QPixmap)
+    failed      = pyqtSignal(int, str)
 
     def __init__(self, item_id, url):
         super().__init__()
@@ -456,9 +689,12 @@ class Card(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
+        # Required so the stylesheet background/border actually paints
+        # on a QWidget subclass.
+        self.setAttribute(Qt.WA_StyledBackground, True)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(22, 18, 22, 18)
-        lay.setSpacing(12)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(6)
         self._layout = lay
 
     def layout(self):
@@ -470,18 +706,18 @@ class Card(QWidget):
 class ToggleGroup(QWidget):
     changed = pyqtSignal(str)   # emits "video" or "audio"
 
-    def __init__(self, parent=None):
+    def __init__(self, video_text="Video", audio_text="Audio", parent=None):
         super().__init__(parent)
         self._mode = "video"
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        self.btn_video = QPushButton("▶  Video")
-        self.btn_audio = QPushButton("♪  Audio")
+        self.btn_video = QPushButton(video_text)
+        self.btn_audio = QPushButton(audio_text)
         for btn in (self.btn_video, self.btn_audio):
-            btn.setFixedHeight(38)
-            btn.setFont(QFont("Segoe UI", 11))
+            btn.setFixedHeight(30)
+            btn.setFont(QFont("Segoe UI", 10))
             btn.setCursor(Qt.PointingHandCursor)
 
         self.btn_video.setObjectName("toggleActive")
@@ -493,7 +729,7 @@ class ToggleGroup(QWidget):
         container.setObjectName("toggleContainer")
         c_lay = QHBoxLayout(container)
         c_lay.setContentsMargins(4, 4, 4, 4)
-        c_lay.setSpacing(0)
+        c_lay.setSpacing(2)
         c_lay.addWidget(self.btn_video)
         c_lay.addWidget(self.btn_audio)
 
@@ -508,11 +744,9 @@ class ToggleGroup(QWidget):
         else:
             self.btn_video.setObjectName("toggleInactive")
             self.btn_audio.setObjectName("toggleActive")
-        # Force style refresh
-        self.btn_video.style().unpolish(self.btn_video)
-        self.btn_video.style().polish(self.btn_video)
-        self.btn_audio.style().unpolish(self.btn_audio)
-        self.btn_audio.style().polish(self.btn_audio)
+        for b in (self.btn_video, self.btn_audio):
+            b.style().unpolish(b)
+            b.style().polish(b)
         self.changed.emit(mode)
 
     def mode(self):
@@ -521,131 +755,200 @@ class ToggleGroup(QWidget):
     def set_mode(self, mode):
         self._select(mode)
 
+    def set_labels(self, video_text, audio_text):
+        self.btn_video.setText(video_text)
+        self.btn_audio.setText(audio_text)
+
 
 # ── Settings dialog ────────────────────────────────────────────────────────────
 
 class SettingsDialog(QDialog):
-    """
-    Central place to configure where video and audio downloads are saved.
-    Choices made here are written to AppSettings immediately, so they are
-    remembered forever (across restarts) — the main window just reads them
-    back the next time it needs a folder.
-    """
+    """Where video/audio are saved, plus theme and language. Saved immediately."""
 
-    def __init__(self, settings: AppSettings, parent=None):
+    def __init__(self, settings: AppSettings, theme, language, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle("Settings")
+        self.theme = theme
+        self.language = language
+        self.setWindowTitle(self._t("settings_window_title"))
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
-        self.setFixedWidth(560)
+        self.setMinimumSize(440, 300)
+        screen = QApplication.primaryScreen()
+        avail_h = screen.availableGeometry().height() if screen else 800
+        self.resize(540, max(300, min(580, avail_h - 120)))
         self._build_ui()
         self._apply_style()
         self._load_current()
 
+    def _t(self, key, **kwargs):
+        return tr(self.language, key, **kwargs)
+
+    def _make_folder_row(self, browse_handler):
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        line = QLineEdit()
+        line.setObjectName("folderInput")
+        line.setFixedHeight(34)
+        line.setReadOnly(True)
+        line.setFont(QFont("Segoe UI", 10))
+        btn = QPushButton(self._t("browse"))
+        btn.setObjectName("browseBtn")
+        btn.setFixedHeight(34)
+        btn.setFixedWidth(96)
+        btn.setFont(QFont("Segoe UI", 10))
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(browse_handler)
+        row.addWidget(line)
+        row.addWidget(btn)
+        return row, line, btn
+
+    def _card_title(self, text):
+        lbl = QLabel(text)
+        lbl.setObjectName("cardTitle")
+        lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        return lbl
+
     def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 20)
-        root.setSpacing(16)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(22, 18, 22, 16)
+        outer.setSpacing(8)
 
-        title = QLabel("⚙  Preferences")
-        title.setObjectName("dlgTitle")
-        title.setFont(QFont("Segoe UI", 15, QFont.Bold))
-        root.addWidget(title)
+        self.dlg_title_lbl = QLabel(self._t("settings_title"))
+        self.dlg_title_lbl.setObjectName("dlgTitle")
+        self.dlg_title_lbl.setFont(QFont("Segoe UI", 15, QFont.Bold))
+        outer.addWidget(self.dlg_title_lbl)
 
-        subtitle = QLabel("Choose where downloads are stored. Your choice is saved automatically.")
-        subtitle.setObjectName("dlgSubtitle")
-        subtitle.setFont(QFont("Segoe UI", 9))
-        subtitle.setWordWrap(True)
-        root.addWidget(subtitle)
+        self.dlg_subtitle_lbl = QLabel(self._t("settings_subtitle"))
+        self.dlg_subtitle_lbl.setObjectName("dlgSubtitle")
+        self.dlg_subtitle_lbl.setFont(QFont("Segoe UI", 9))
+        self.dlg_subtitle_lbl.setWordWrap(True)
+        outer.addWidget(self.dlg_subtitle_lbl)
 
-        # Same-folder toggle
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        content.setAttribute(Qt.WA_StyledBackground, True)
+        root = QVBoxLayout(content)
+        root.setContentsMargins(0, 6, 12, 6)
+        root.setSpacing(12)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, stretch=1)
+
+        # Appearance
+        appearance_card = Card()
+        lay = appearance_card.layout()
+        self.appearance_lbl = self._card_title(self._t("appearance"))
+        lay.addWidget(self.appearance_lbl)
+        self.theme_radio_group = QButtonGroup(self)
+        self.radio_dark = QRadioButton(self._t("theme_dark"))
+        self.radio_light = QRadioButton(self._t("theme_light"))
+        for r in (self.radio_dark, self.radio_light):
+            r.setObjectName("settingsRadio")
+            r.setFont(QFont("Segoe UI", 10))
+            r.setCursor(Qt.PointingHandCursor)
+            self.theme_radio_group.addButton(r)
+        self.radio_dark.toggled.connect(self._on_theme_toggled)
+        lay.addWidget(self.radio_dark)
+        lay.addWidget(self.radio_light)
+        root.addWidget(appearance_card)
+
+        # Language
+        language_card = Card()
+        lay = language_card.layout()
+        self.language_lbl = self._card_title(self._t("language_section"))
+        lay.addWidget(self.language_lbl)
+        self.language_radio_group = QButtonGroup(self)
+        self.radio_en = QRadioButton("English")
+        self.radio_km = QRadioButton("ខ្មែរ")
+        for r in (self.radio_en, self.radio_km):
+            r.setObjectName("settingsRadio")
+            r.setFont(QFont("Segoe UI", 10))
+            r.setCursor(Qt.PointingHandCursor)
+            self.language_radio_group.addButton(r)
+        self.radio_en.toggled.connect(self._on_language_toggled)
+        lay.addWidget(self.radio_en)
+        lay.addWidget(self.radio_km)
+        root.addWidget(language_card)
+
+        # Storage mode
         same_card = Card()
-        same_lay = same_card.layout()
-        same_lbl = QLabel("Storage Mode")
-        same_lbl.setObjectName("cardTitle")
-        same_lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        same_lay.addWidget(same_lbl)
-
+        lay = same_card.layout()
+        self.storage_mode_lbl = self._card_title(self._t("storage_mode"))
+        lay.addWidget(self.storage_mode_lbl)
         self.radio_group = QButtonGroup(self)
-        self.radio_same = QRadioButton("Use one folder for everything")
-        self.radio_split = QRadioButton("Use separate folders for Video and Audio")
+        self.radio_same = QRadioButton(self._t("storage_same"))
+        self.radio_split = QRadioButton(self._t("storage_split"))
         for r in (self.radio_same, self.radio_split):
             r.setObjectName("settingsRadio")
             r.setFont(QFont("Segoe UI", 10))
+            r.setCursor(Qt.PointingHandCursor)
             self.radio_group.addButton(r)
         self.radio_same.toggled.connect(self._toggle_mode)
-        same_lay.addWidget(self.radio_same)
-        same_lay.addWidget(self.radio_split)
+        lay.addWidget(self.radio_same)
+        lay.addWidget(self.radio_split)
         root.addWidget(same_card)
 
         # Video folder
         video_card = Card()
-        video_lay = video_card.layout()
-        v_lbl = QLabel("🎬  Video Save Location")
-        v_lbl.setObjectName("cardTitle")
-        v_lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        video_lay.addWidget(v_lbl)
-
-        v_row = QHBoxLayout()
-        v_row.setSpacing(8)
-        self.video_path = QLineEdit()
-        self.video_path.setObjectName("folderInput")
-        self.video_path.setFixedHeight(38)
-        self.video_path.setReadOnly(True)
-        self.video_path.setFont(QFont("Segoe UI", 10))
-        video_browse = QPushButton("Browse...")
-        video_browse.setObjectName("browseBtn")
-        video_browse.setFixedHeight(38)
-        video_browse.setFixedWidth(90)
-        video_browse.setFont(QFont("Segoe UI", 10))
-        video_browse.clicked.connect(self._browse_video)
-        v_row.addWidget(self.video_path)
-        v_row.addWidget(video_browse)
-        video_lay.addLayout(v_row)
+        self.video_title_lbl = self._card_title(self._t("video_location"))
+        video_card.layout().addWidget(self.video_title_lbl)
+        v_row, self.video_path, self.video_browse_btn = self._make_folder_row(self._browse_video)
+        video_card.layout().addLayout(v_row)
         root.addWidget(video_card)
         self.video_card = video_card
 
         # Audio folder
         audio_card = Card()
-        audio_lay = audio_card.layout()
-        a_lbl = QLabel("🎵  Audio Save Location")
-        a_lbl.setObjectName("cardTitle")
-        a_lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        audio_lay.addWidget(a_lbl)
-
-        a_row = QHBoxLayout()
-        a_row.setSpacing(8)
-        self.audio_path = QLineEdit()
-        self.audio_path.setObjectName("folderInput")
-        self.audio_path.setFixedHeight(38)
-        self.audio_path.setReadOnly(True)
-        self.audio_path.setFont(QFont("Segoe UI", 10))
-        audio_browse = QPushButton("Browse...")
-        audio_browse.setObjectName("browseBtn")
-        audio_browse.setFixedHeight(38)
-        audio_browse.setFixedWidth(90)
-        audio_browse.setFont(QFont("Segoe UI", 10))
-        audio_browse.clicked.connect(self._browse_audio)
-        a_row.addWidget(self.audio_path)
-        a_row.addWidget(audio_browse)
-        audio_lay.addLayout(a_row)
+        self.audio_card_title_lbl = self._card_title(self._t("audio_location"))
+        audio_card.layout().addWidget(self.audio_card_title_lbl)
+        a_row, self.audio_path, self.audio_browse_btn = self._make_folder_row(self._browse_audio)
+        audio_card.layout().addLayout(a_row)
         root.addWidget(audio_card)
         self.audio_card = audio_card
+        root.addStretch()
 
         # Buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        close_btn = QPushButton("Done")
-        close_btn.setObjectName("dlBtnSmall")
-        close_btn.setFixedHeight(42)
-        close_btn.setFixedWidth(120)
-        close_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
-        root.addLayout(btn_row)
+        self.done_btn = QPushButton(self._t("done"))
+        self.done_btn.setObjectName("dlBtnSmall")
+        self.done_btn.setFixedHeight(38)
+        self.done_btn.setFixedWidth(120)
+        self.done_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.done_btn.setCursor(Qt.PointingHandCursor)
+        self.done_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.done_btn)
+        outer.addLayout(btn_row)
+
+    def _retranslate_ui(self):
+        self.setWindowTitle(self._t("settings_window_title"))
+        self.dlg_title_lbl.setText(self._t("settings_title"))
+        self.dlg_subtitle_lbl.setText(self._t("settings_subtitle"))
+        self.appearance_lbl.setText(self._t("appearance"))
+        self.radio_dark.setText(self._t("theme_dark"))
+        self.radio_light.setText(self._t("theme_light"))
+        self.language_lbl.setText(self._t("language_section"))
+        self.storage_mode_lbl.setText(self._t("storage_mode"))
+        self.radio_same.setText(self._t("storage_same"))
+        self.radio_split.setText(self._t("storage_split"))
+        self.audio_card_title_lbl.setText(self._t("audio_location"))
+        self.video_browse_btn.setText(self._t("browse"))
+        self.audio_browse_btn.setText(self._t("browse"))
+        self.done_btn.setText(self._t("done"))
+        self._toggle_mode()
 
     def _load_current(self):
+        theme_name = self.settings.get_theme()
+        self.radio_dark.setChecked(theme_name != "light")
+        self.radio_light.setChecked(theme_name == "light")
+
+        self.radio_en.setChecked(self.language != "km")
+        self.radio_km.setChecked(self.language == "km")
+
         use_same = self.settings.get_use_same_dir()
         self.radio_same.setChecked(use_same)
         self.radio_split.setChecked(not use_same)
@@ -653,16 +956,39 @@ class SettingsDialog(QDialog):
         self.audio_path.setText(self.settings.get_audio_dir())
         self._toggle_mode()
 
+    def _on_theme_toggled(self):
+        name = "light" if self.radio_light.isChecked() else "dark"
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_apply_theme"):
+            parent._apply_theme(name)
+            self.theme = parent.theme
+        else:
+            self.settings.set_theme(name)
+            self.theme = THEMES[name]
+        self._apply_style()
+
+    def _on_language_toggled(self):
+        name = "km" if self.radio_km.isChecked() else "en"
+        if name == self.language:
+            return
+        self.language = name
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_apply_language"):
+            parent._apply_language(name)
+        else:
+            self.settings.set_language(name)
+        self._retranslate_ui()
+
     def _toggle_mode(self):
         split = self.radio_split.isChecked()
         self.audio_card.setVisible(split)
-        self.video_card.findChild(QLabel, "cardTitle").setText(
-            "🎬  Video Save Location" if split else "📁  Save Location (Video & Audio)"
+        self.video_title_lbl.setText(
+            self._t("video_location") if split else self._t("combined_location")
         )
         self.settings.set_use_same_dir(not split)
 
     def _browse_video(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Video Folder", self.video_path.text())
+        folder = QFileDialog.getExistingDirectory(self, self._t("select_video_folder"), self.video_path.text())
         if folder:
             self.video_path.setText(folder)
             self.settings.set_video_dir(folder)
@@ -671,82 +997,16 @@ class SettingsDialog(QDialog):
                 self.audio_path.setText(folder)
 
     def _browse_audio(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Audio Folder", self.audio_path.text())
+        folder = QFileDialog.getExistingDirectory(self, self._t("select_audio_folder"), self.audio_path.text())
         if folder:
             self.audio_path.setText(folder)
             self.settings.set_audio_dir(folder)
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QDialog { background: #17140F; }
-            QWidget { font-family: 'Segoe UI', Arial, sans-serif; }
-            QLabel#dlgTitle    { color: #F4E9C9; }
-            QLabel#dlgSubtitle { color: #8A8375; }
-            QWidget#card {
-                background: #201C15;
-                border: 1px solid #3A331F;
-                border-radius: 14px;
-            }
-            QLabel#cardTitle { color: #E9DBAF; }
-            QRadioButton#settingsRadio { color: #C9C2AF; padding: 4px 0; }
-            QRadioButton#settingsRadio::indicator {
-                width: 16px; height: 16px;
-                border: 2px solid #6B5F3C;
-                border-radius: 9px;
-                background: transparent;
-            }
-            QRadioButton#settingsRadio::indicator:checked {
-                background: #D4AF37;
-                border-color: #D4AF37;
-            }
-            QLineEdit#folderInput {
-                background: #14120D;
-                border: 2px solid #3A331F;
-                border-radius: 8px;
-                padding: 0 12px;
-                color: #B7AF98;
-            }
-            QPushButton#browseBtn {
-                background: #26221A;
-                color: #E9DBAF;
-                border: 2px solid #4A4128;
-                border-radius: 8px;
-                font-weight: 500;
-            }
-            QPushButton#browseBtn:hover {
-                border-color: #D4AF37;
-                background: #2C2719;
-            }
-            QPushButton#browseBtn:pressed { background: #1C1912; }
-            QPushButton#dlBtnSmall {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #D4AF37, stop:0.5 #E8CB5E, stop:1 #D4AF37);
-                color: #1A1608;
-                border: none;
-                border-radius: 10px;
-            }
-            QPushButton#dlBtnSmall:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #E0C04A, stop:0.5 #F2D876, stop:1 #E0C04A);
-            }
-            QPushButton#dlBtnSmall:pressed { background: #B8963A; }
-        """)
+        self.setStyleSheet(build_dialog_qss(self.theme))
 
-# ── Main window ────────────────────────────────────────────────────────────────
-#
-# Redesigned to match a MediaHuman-style queue list:
-#   • A single "Paste Link" action (button or Ctrl+V paste) adds a URL as a
-#     queued row — no permanent big URL textbox in the main flow.
-#   • Each row shows a thumbnail placeholder, title/URL, status text, and two
-#     small icon buttons: ⬇ (download this item) and ✕ (remove this item).
-#   • Tabs across the top filter the queue: All / Ready / Processing / Failed
-#     / Skipped / Complete — counts update live.
-#   • Save-to-location lives ONLY in Settings now; there is no folder field
-#     on the main screen at all.
-#   • A top-level Format switch (Video / Audio) plus quality picker decides
-#     how *newly downloaded* items are fetched; each item remembers its own
-#     mode so a mixed queue (some audio, some video) is possible if the user
-#     changes the switch between pastes.
+
+# ── Queue model / helpers ──────────────────────────────────────────────────────
 
 QUEUE_STATUS_QUEUED     = "queued"
 QUEUE_STATUS_LOADING    = "loading"
@@ -756,16 +1016,92 @@ QUEUE_STATUS_COMPLETE   = "complete"
 QUEUE_STATUS_FAILED     = "failed"
 QUEUE_STATUS_SKIPPED    = "skipped"
 
-_YT_URL_RE = re.compile(r'(https?://[^\s]*(?:youtube\.com|youtu\.be)[^\s]*)', re.IGNORECASE)
+_VIDEO_URL_RE = re.compile(
+    r'(https?://[^\s]*(?:'
+    r'youtube\.com|youtu\.be'
+    r'|(?:[a-z0-9-]+\.)?facebook\.com|fb\.watch'
+    r'|(?:www\.)?instagram\.com|instagr\.am'
+    r'|(?:[a-z0-9-]+\.)?tiktok\.com'
+    r')[^\s]*)',
+    re.IGNORECASE,
+)
+
+PLATFORM_LABELS = {"youtube": "YouTube", "facebook": "Facebook", "instagram": "Instagram", "tiktok": "TikTok"}
+
+PAGE_YOUTUBE = "youtube"
+PAGE_META = "meta"
+PAGE_TIKTOK = "tiktok"
+PAGE_KEYS = [PAGE_YOUTUBE, PAGE_META, PAGE_TIKTOK]
+
+PLATFORM_TO_PAGE = {
+    "youtube": PAGE_YOUTUBE,
+    "facebook": PAGE_META,
+    "instagram": PAGE_META,
+    "tiktok": PAGE_TIKTOK,
+}
+
+PAGE_NAMES = {PAGE_YOUTUBE: "YouTube", PAGE_META: "Facebook & Instagram", PAGE_TIKTOK: "TikTok"}
+
+
+def _page_tab_text(key, count):
+    # "&" is a keyboard-mnemonic marker in Qt button text; "&&" shows a literal "&".
+    return f"{PAGE_NAMES[key].replace('&', '&&')}   ({count})"
+
+
+def _detect_platform(url):
+    host = (url or "").lower()
+    if "youtube.com" in host or "youtu.be" in host:
+        return "youtube"
+    if "facebook.com" in host or "fb.watch" in host:
+        return "facebook"
+    if "instagram.com" in host or "instagr.am" in host:
+        return "instagram"
+    if "tiktok.com" in host:
+        return "tiktok"
+    return "other"
+
 
 _YT_LIST_STRIP_RE = re.compile(r'([&?])(list|start_radio|index)=[^&]*')
 
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "mc_cid", "mc_eid",
+    "extid", "mibextid", "rdid",
+    "igshid", "igsh",
+    "is_from_webapp", "sender_device", "sender_web_id", "web_id",
+    "share_app_id", "share_item_id", "_r", "_t", "checksum",
+}
 
-def _clean_youtube_url(url):
-    """Strip playlist/radio-mix params (list=, start_radio=, index=) so a
-    pasted 'Radio' or 'Mix' link resolves as a single video instead of
-    yt-dlp trying (and often failing) to walk an auto-generated playlist."""
-    cleaned = _YT_LIST_STRIP_RE.sub('', url)
+
+def _youtube_list_info(url):
+    """Returns (has_list, has_single_video) for a YouTube URL."""
+    if _detect_platform(url) != "youtube":
+        return False, True
+    try:
+        parts = urlparse.urlsplit(url)
+    except ValueError:
+        return False, True
+    q = dict(urlparse.parse_qsl(parts.query))
+    has_list = bool(q.get("list"))
+    has_video = bool(q.get("v")) or "youtu.be" in parts.netloc.lower() or "/shorts/" in parts.path
+    return has_list, has_video
+
+
+def _clean_url(url, keep_list=False):
+    """Strip YouTube playlist params and known tracking-only params."""
+    cleaned = url
+    if _detect_platform(url) == "youtube" and not keep_list:
+        cleaned = _YT_LIST_STRIP_RE.sub('', url)
+    try:
+        parts = urlparse.urlsplit(cleaned)
+        if parts.query:
+            kept = [
+                (k, v) for k, v in urlparse.parse_qsl(parts.query, keep_blank_values=True)
+                if k.lower() not in _TRACKING_PARAMS
+            ]
+            cleaned = urlparse.urlunsplit(parts._replace(query=urlparse.urlencode(kept)))
+    except ValueError:
+        pass
     cleaned = re.sub(r'[?&]+$', '', cleaned)
     cleaned = cleaned.replace('?&', '?')
     return cleaned
@@ -775,9 +1111,6 @@ _STATUS_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m|\[[0-9;]*m")
 
 
 def _clean_status_text(text):
-    """Strip ANSI color codes (and yt-dlp's escaped '\x1b[' variants that
-    sometimes arrive as literal text) and collapse whitespace/newlines so
-    error messages fit on one line."""
     if not text:
         return ""
     text = _STATUS_ANSI_RE.sub("", str(text))
@@ -795,12 +1128,13 @@ class QueueItem:
         QueueItem._next_id += 1
         self.url        = url
         self.title      = url
-        self.channel     = ""
+        self.channel    = ""
         self.duration   = ""
+        self.platform   = _detect_platform(url)
         self.thumbnail_url = ""
-        self.thumbnail_pixmap = None   # QPixmap once loaded
+        self.thumbnail_pixmap = None
         self.status     = QUEUE_STATUS_QUEUED
-        self.mode       = "mp4"     # "mp4" or "mp3" — set when downloaded
+        self.mode       = "mp4"
         self.quality    = "best"
         self.subtitles  = False
         self.error_msg  = ""
@@ -808,8 +1142,8 @@ class QueueItem:
 
 
 class QueueRowWidget(QWidget):
-    """A single visual row in the queue list, styled like the MediaHuman rows."""
-    download_clicked     = pyqtSignal(int)   # emits queue item id
+    """A single visual row in the queue list."""
+    download_clicked     = pyqtSignal(int)
     remove_clicked       = pyqtSignal(int)
     open_folder_clicked  = pyqtSignal(int)
 
@@ -817,27 +1151,27 @@ class QueueRowWidget(QWidget):
         super().__init__(parent)
         self.item_id = item.id
         self.setObjectName("queueRow")
-        self.setFixedHeight(64)
+        self.setAttribute(Qt.WA_StyledBackground, True)   # paint bg / hover / border
+        self.setFixedHeight(68)
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setContentsMargins(16, 10, 16, 10)
         lay.setSpacing(12)
 
-        # Thumbnail placeholder
         self.thumb = QLabel("▶")
         self.thumb.setObjectName("rowThumb")
         self.thumb.setFixedSize(48, 48)
         self.thumb.setAlignment(Qt.AlignCenter)
-        self.thumb.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        self.thumb.setFont(QFont("Segoe UI", 14, QFont.Bold))
         lay.addWidget(self.thumb)
 
-        # Title + status column
         text_col = QVBoxLayout()
-        text_col.setSpacing(2)
+        text_col.setSpacing(3)
         self.title_lbl = QLabel()
         self.title_lbl.setObjectName("rowTitle")
-        self.title_lbl.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.title_lbl.setFont(QFont("Segoe UI", 10, QFont.DemiBold))
         self.title_lbl.setWordWrap(False)
+        self.title_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.status_lbl = QLabel()
         self.status_lbl.setObjectName("rowStatus")
         self.status_lbl.setFont(QFont("Segoe UI", 8))
@@ -848,7 +1182,6 @@ class QueueRowWidget(QWidget):
         text_col.addWidget(self.status_lbl)
         lay.addLayout(text_col, stretch=1)
 
-        # Small progress bar (only visible while processing)
         self.mini_progress = QProgressBar()
         self.mini_progress.setObjectName("miniProgress")
         self.mini_progress.setFixedWidth(180)
@@ -860,53 +1193,55 @@ class QueueRowWidget(QWidget):
         self.mini_progress.setVisible(False)
         lay.addWidget(self.mini_progress)
 
-        # Per-row action icons: Download / Open Folder / Remove
-        self.download_btn = QPushButton("⬇")
+        # Icon-only action buttons (icons are set in update_from, per theme)
+        self.download_btn = QPushButton()
         self.download_btn.setObjectName("rowDownloadBtn")
-        self.download_btn.setFixedSize(30, 30)
-        self.download_btn.setFont(QFont("Segoe UI", 11))
-        self.download_btn.setCursor(Qt.PointingHandCursor)
-        self.download_btn.setToolTip("Download this item")
-        self.download_btn.clicked.connect(lambda: self.download_clicked.emit(self.item_id))
-        lay.addWidget(self.download_btn)
-
-        self.folder_btn = QPushButton("📂")
+        self.folder_btn = QPushButton()
         self.folder_btn.setObjectName("rowFolderBtn")
-        self.folder_btn.setFixedSize(30, 30)
-        self.folder_btn.setFont(QFont("Segoe UI", 11))
-        self.folder_btn.setCursor(Qt.PointingHandCursor)
-        self.folder_btn.setToolTip("Open containing folder")
-        self.folder_btn.clicked.connect(lambda: self.open_folder_clicked.emit(self.item_id))
-        lay.addWidget(self.folder_btn)
-
-        self.remove_btn = QPushButton("✕")
+        self.remove_btn = QPushButton()
         self.remove_btn.setObjectName("rowRemoveBtn")
-        self.remove_btn.setFixedSize(30, 30)
-        self.remove_btn.setFont(QFont("Segoe UI", 10))
-        self.remove_btn.setCursor(Qt.PointingHandCursor)
-        self.remove_btn.setToolTip("Remove from list")
+        for btn in (self.download_btn, self.folder_btn, self.remove_btn):
+            btn.setFixedSize(32, 32)
+            btn.setIconSize(QSize(16, 16))
+            btn.setCursor(Qt.PointingHandCursor)
+            lay.addWidget(btn)
+        self.download_btn.clicked.connect(lambda: self.download_clicked.emit(self.item_id))
+        self.folder_btn.clicked.connect(lambda: self.open_folder_clicked.emit(self.item_id))
         self.remove_btn.clicked.connect(lambda: self.remove_clicked.emit(self.item_id))
-        lay.addWidget(self.remove_btn)
 
         self.update_from(item)
 
     def update_from(self, item: QueueItem):
+        win = self.window()
+        t = getattr(win, "theme", None) or THEMES["dark"]
+        lang = getattr(win, "language", None) or "en"
+
+        for btn, name, col in (
+            (self.download_btn, "download", t["accent_text"]),
+            (self.folder_btn,   "folder",   t["text2"]),
+            (self.remove_btn,   "close",    t["danger"]),
+        ):
+            btn.setIcon(make_icon(name, col, 16))
+
         self.title_lbl.setText(item.title)
         icon_map = {
-            QUEUE_STATUS_QUEUED:     ("⏳", "#8A8066", "Queued"),
-            QUEUE_STATUS_LOADING:    ("⟳",  "#D4AF37", "Loading info…"),
-            QUEUE_STATUS_READY:      ("●",  "#6FBF73", "Ready"),
-            QUEUE_STATUS_PROCESSING: ("⬇",  "#D4AF37", "Downloading…"),
-            QUEUE_STATUS_COMPLETE:   ("✓",  "#6FBF73", "Done"),
-            QUEUE_STATUS_FAILED:     ("✗",  "#D96C5F", "Failed"),
-            QUEUE_STATUS_SKIPPED:    ("↷",  "#8A8066", "Skipped"),
+            QUEUE_STATUS_QUEUED:     ("●", t["dim"],     tr(lang, "status_queued")),
+            QUEUE_STATUS_LOADING:    ("●", t["accent"],  tr(lang, "status_loading")),
+            QUEUE_STATUS_READY:      ("●", t["success"], tr(lang, "status_ready")),
+            QUEUE_STATUS_PROCESSING: ("●", t["accent"],  tr(lang, "status_processing")),
+            QUEUE_STATUS_COMPLETE:   ("●", t["success"], tr(lang, "status_complete")),
+            QUEUE_STATUS_FAILED:     ("●", t["danger"],  tr(lang, "status_failed")),
+            QUEUE_STATUS_SKIPPED:    ("●", t["dim"],     tr(lang, "status_skipped")),
         }
-        icon, color, label = icon_map.get(item.status, ("", "#8A8066", ""))
-        kind = "🎵" if item.mode == "mp3" else "🎬"
+        icon, color, label = icon_map.get(item.status, ("", t["dim"], ""))
+        kind = "♪" if item.mode == "mp3" else "▶"
         raw_detail = item.error_msg if item.status == QUEUE_STATUS_FAILED else (
             item.channel if item.channel else item.url
         )
         detail = _clean_status_text(raw_detail)
+        plat_label = PLATFORM_LABELS.get(getattr(item, "platform", ""), "")
+        if plat_label:
+            detail = f"{plat_label} • {detail}" if detail else plat_label
         full_text = f"{icon} {label} — {detail}" if detail else f"{icon} {label}"
 
         metrics = self.status_lbl.fontMetrics()
@@ -919,21 +1254,23 @@ class QueueRowWidget(QWidget):
         if item.thumbnail_pixmap is not None:
             self.set_thumbnail_pixmap(item.thumbnail_pixmap)
         else:
-            self.thumb.setPixmap(QPixmap())  # clear any stale image
+            self.thumb.setPixmap(QPixmap())
             self.thumb.setText(kind)
 
         self.mini_progress.setVisible(item.status == QUEUE_STATUS_PROCESSING)
 
-        # Disable the download icon once complete/processing; disable remove while processing
         self.download_btn.setEnabled(item.status not in (QUEUE_STATUS_PROCESSING,))
         self.remove_btn.setEnabled(item.status != QUEUE_STATUS_PROCESSING)
         self.folder_btn.setEnabled(item.status == QUEUE_STATUS_COMPLETE and bool(item.output_dir))
-        if item.status == QUEUE_STATUS_COMPLETE:
-            self.download_btn.setToolTip("Download again")
+        self.download_btn.setToolTip(
+            tr(lang, "tooltip_download_again") if item.status == QUEUE_STATUS_COMPLETE
+            else tr(lang, "tooltip_download")
+        )
+        self.folder_btn.setToolTip(tr(lang, "tooltip_open_folder"))
+        self.remove_btn.setToolTip(tr(lang, "tooltip_remove"))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Re-elide using the tooltip's full text (set whenever truncated)
         full_text = self.status_lbl.toolTip() or self.status_lbl.text()
         if full_text:
             metrics = self.status_lbl.fontMetrics()
@@ -945,9 +1282,7 @@ class QueueRowWidget(QWidget):
     def set_thumbnail_pixmap(self, pixmap: QPixmap):
         """Render a cropped, rounded-corner thumbnail into the fixed 48x48 slot."""
         size = self.thumb.width()
-        scaled = pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding,
-                                Qt.SmoothTransformation)
-        # Center-crop to a square
+        scaled = pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         x = max(0, (scaled.width()  - size) // 2)
         y = max(0, (scaled.height() - size) // 2)
         cropped = scaled.copy(x, y, size, size)
@@ -966,17 +1301,24 @@ class QueueRowWidget(QWidget):
         self.thumb.setPixmap(rounded)
 
 
+# ── Main window ────────────────────────────────────────────────────────────────
+
 class YouTubeDownloader(QMainWindow):
     MAX_CONCURRENT_DOWNLOADS = 3
 
     def __init__(self):
         super().__init__()
         self.settings     = AppSettings()
-        self.workers      = {}     # item_id -> DownloadWorker (active concurrent downloads)
+        self.theme_name   = self.settings.get_theme()
+        self.theme        = THEMES[self.theme_name]
+        self.language     = self.settings.get_language()
+        self.active_page  = PAGE_YOUTUBE
+        self.workers      = {}
         self.info_worker  = None
-        self.queue_items  = {}     # id -> QueueItem
-        self.row_widgets  = {}     # id -> QueueRowWidget
-        self.download_queue_ids = []  # ids waiting for a free download slot
+        self._playlist_workers = []   # keep references so threads aren't GC'd
+        self.queue_items  = {}
+        self.row_widgets  = {}
+        self.download_queue_ids = []
 
         self._build_ui()
         self._apply_style()
@@ -984,14 +1326,23 @@ class YouTubeDownloader(QMainWindow):
         self._restore_saved_queue()
         self._refresh_tabs_and_list()
 
+    def _t(self, key, **kwargs):
+        return tr(self.language, key, **kwargs)
+
+    def _quality_label(self, key):
+        if key == "best4k":
+            return self._t("quality_best")
+        if key == "audio_only":
+            return self._t("quality_audio_only")
+        return key
+
     def _ts(self):
         return datetime.now().strftime("[%-I:%M:%S %p]") if sys.platform != "win32" \
                else datetime.now().strftime("[%I:%M:%S %p]")
 
     def _current_output_dir(self):
-        """Returns the save folder for whatever mode (video/audio) is active right now."""
         mode = self.toggle.mode()
-        if mode == "audio" or self.quality_combo.currentText() == "Audio Only":
+        if mode == "audio" or self.quality_combo.currentData() == "audio_only":
             return self.settings.get_audio_dir()
         return self.settings.get_video_dir()
 
@@ -1013,7 +1364,7 @@ class YouTubeDownloader(QMainWindow):
 
     def _build_ui(self):
         self.setWindowTitle("TheHours YouTube Downloader")
-        self.setMinimumWidth(760)
+        self.setMinimumWidth(860)
         self.setMinimumHeight(640)
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
 
@@ -1029,10 +1380,10 @@ class YouTubeDownloader(QMainWindow):
         toolbar = QWidget()
         toolbar.setObjectName("toolbar")
         tb_lay = QHBoxLayout(toolbar)
-        tb_lay.setContentsMargins(16, 10, 16, 10)
+        tb_lay.setContentsMargins(16, 12, 16, 12)
         tb_lay.setSpacing(10)
 
-        self.paste_btn = QPushButton("⊕  Paste Link")
+        self.paste_btn = QPushButton(self._t("paste_link"))
         self.paste_btn.setObjectName("pasteBtn")
         self.paste_btn.setFixedHeight(38)
         self.paste_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
@@ -1040,28 +1391,36 @@ class YouTubeDownloader(QMainWindow):
         self.paste_btn.clicked.connect(self._paste_from_clipboard)
         tb_lay.addWidget(self.paste_btn)
 
-        # Format toggle (Video / Audio) — decides mode for newly added links
-        self.toggle = ToggleGroup()
+        self.toggle = ToggleGroup(self._t("video"), self._t("audio"))
         self.toggle.changed.connect(self._on_format_change)
         tb_lay.addWidget(self.toggle)
 
         self.quality_combo = QComboBox()
         self.quality_combo.setObjectName("qualityCombo")
-        self.quality_combo.setFixedHeight(36)
+        self.quality_combo.setFixedHeight(38)
         self.quality_combo.setFont(QFont("Segoe UI", 9))
-        self.quality_combo.addItems(["Best (4K)", "1080p", "720p", "480p", "360p", "Audio Only"])
-        self.quality_combo.setFixedWidth(140)
-        self.quality_combo.currentTextChanged.connect(self._on_quality_change)
+        for key in QUALITY_KEYS:
+            self.quality_combo.addItem(self._quality_label(key), key)
+        self.quality_combo.setFixedWidth(150)
+        self.quality_combo.currentIndexChanged.connect(self._on_quality_change)
         tb_lay.addWidget(self.quality_combo)
 
-        self.sub_check = QCheckBox("Subtitles")
+        self.sub_check = QCheckBox(self._t("subtitles"))
         self.sub_check.setObjectName("subCheck")
         self.sub_check.setFont(QFont("Segoe UI", 9))
         tb_lay.addWidget(self.sub_check)
 
         tb_lay.addStretch()
 
-        self.header_settings_btn = QPushButton("⚙  Settings")
+        self.theme_btn = QPushButton()
+        self.theme_btn.setObjectName("themeBtn")
+        self.theme_btn.setFixedSize(38, 38)
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.setToolTip(self._t("theme_tooltip"))
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        tb_lay.addWidget(self.theme_btn)
+
+        self.header_settings_btn = QPushButton(self._t("settings"))
         self.header_settings_btn.setObjectName("headerSettingsBtn")
         self.header_settings_btn.setFixedHeight(38)
         self.header_settings_btn.setFont(QFont("Segoe UI", 10))
@@ -1069,7 +1428,7 @@ class YouTubeDownloader(QMainWindow):
         self.header_settings_btn.clicked.connect(self._open_settings)
         tb_lay.addWidget(self.header_settings_btn)
 
-        self.download_all_btn = QPushButton("⬇  Download All Ready")
+        self.download_all_btn = QPushButton(self._t("download_all_ready"))
         self.download_all_btn.setObjectName("dlAllBtn")
         self.download_all_btn.setFixedHeight(38)
         self.download_all_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
@@ -1079,20 +1438,40 @@ class YouTubeDownloader(QMainWindow):
 
         main.addWidget(toolbar)
 
-        # ── Filter tabs (All / Ready / Processing / Failed / Skipped / Complete)
+        # ── Platform page tabs (underline style) ──────────────────────────
+        page_tabs_bar = QWidget()
+        page_tabs_bar.setObjectName("pageTabsBar")
+        page_tabs_lay = QHBoxLayout(page_tabs_bar)
+        page_tabs_lay.setContentsMargins(12, 0, 12, 0)
+        page_tabs_lay.setSpacing(4)
+
+        self.page_buttons = {}
+        for key in PAGE_KEYS:
+            btn = QPushButton(_page_tab_text(key, 0))
+            btn.setObjectName("pageTabActive" if key == self.active_page else "pageTabInactive")
+            btn.setFixedHeight(42)
+            btn.setFont(QFont("Segoe UI", 10, QFont.Bold if key == self.active_page else QFont.Normal))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _, k=key: self._switch_page(k))
+            page_tabs_lay.addWidget(btn)
+            self.page_buttons[key] = btn
+        page_tabs_lay.addStretch()
+        main.addWidget(page_tabs_bar)
+
+        # ── Filter tabs ───────────────────────────────────────────────────
         tabs_bar = QWidget()
         tabs_bar.setObjectName("tabsBar")
         tabs_lay = QHBoxLayout(tabs_bar)
-        tabs_lay.setContentsMargins(16, 8, 16, 8)
+        tabs_lay.setContentsMargins(16, 10, 16, 10)
         tabs_lay.setSpacing(6)
 
         self.filter_buttons = {}
         self.filter_mode = "all"
-        for key, label in [
-            ("all", "All"), ("ready", "Ready"), ("processing", "Processing"),
-            ("failed", "Failed"), ("skipped", "Skipped"), ("complete", "Complete"),
+        for key, tr_key in [
+            ("all", "tab_all"), ("ready", "tab_ready"), ("processing", "tab_processing"),
+            ("failed", "tab_failed"), ("skipped", "tab_skipped"), ("complete", "tab_complete"),
         ]:
-            btn = QPushButton(f"{label} (0)")
+            btn = QPushButton(f"{self._t(tr_key)} (0)")
             btn.setObjectName("filterTabActive" if key == "all" else "filterTabInactive")
             btn.setFixedHeight(30)
             btn.setFont(QFont("Segoe UI", 9, QFont.Bold if key == "all" else QFont.Normal))
@@ -1103,37 +1482,41 @@ class YouTubeDownloader(QMainWindow):
         tabs_lay.addStretch()
         main.addWidget(tabs_bar)
 
-        # ── Split view: queue list (left) + integrated history panel (right) ──
+        # ── Split view: queue list + history panel ────────────────────────
         split = QWidget()
         split.setObjectName("splitView")
         split_lay = QHBoxLayout(split)
         split_lay.setContentsMargins(0, 0, 0, 0)
         split_lay.setSpacing(0)
 
-        # Queue list
         self.queue_scroll = QScrollArea()
         self.queue_scroll.setObjectName("queueScroll")
         self.queue_scroll.setWidgetResizable(True)
         self.queue_scroll.setFrameShape(QFrame.NoFrame)
         self.queue_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        self.queue_container = QWidget()
-        self.queue_container.setObjectName("queueContainer")
-        self.queue_list_lay = QVBoxLayout(self.queue_container)
-        self.queue_list_lay.setContentsMargins(0, 0, 0, 0)
-        self.queue_list_lay.setSpacing(1)
-        self.queue_list_lay.addStretch()
+        empty_hint_keys = {PAGE_YOUTUBE: "empty_hint_youtube", PAGE_META: "empty_hint_meta", PAGE_TIKTOK: "empty_hint_tiktok"}
+        self.page_containers = {}
+        for key in PAGE_KEYS:
+            container = QWidget()
+            container.setObjectName("queueContainer")
+            container.setAttribute(Qt.WA_StyledBackground, True)
+            list_lay = QVBoxLayout(container)
+            list_lay.setContentsMargins(0, 0, 0, 0)
+            list_lay.setSpacing(0)
+            list_lay.addStretch()
 
-        self.empty_hint = QLabel("No links yet — click \"Paste Link\" to add a YouTube URL to your list.")
-        self.empty_hint.setObjectName("emptyHint")
-        self.empty_hint.setAlignment(Qt.AlignCenter)
-        self.empty_hint.setFont(QFont("Segoe UI", 10))
-        self.queue_list_lay.insertWidget(0, self.empty_hint)
+            empty_hint = QLabel(self._t(empty_hint_keys[key]))
+            empty_hint.setObjectName("emptyHint")
+            empty_hint.setAlignment(Qt.AlignCenter)
+            empty_hint.setFont(QFont("Segoe UI", 10))
+            list_lay.insertWidget(0, empty_hint)
 
-        self.queue_scroll.setWidget(self.queue_container)
+            self.page_containers[key] = (container, list_lay, empty_hint)
+
+        self.queue_scroll.setWidget(self.page_containers[self.active_page][0])
         split_lay.addWidget(self.queue_scroll, stretch=1)
 
-        # Integrated history panel (hidden by default, toggled from footer)
         self.history_panel = self._build_history_panel()
         self.history_panel.setVisible(False)
         split_lay.addWidget(self.history_panel)
@@ -1146,13 +1529,13 @@ class YouTubeDownloader(QMainWindow):
         sb_lay = QHBoxLayout(status_bar)
         sb_lay.setContentsMargins(16, 8, 16, 8)
 
-        self.ver_lbl = QLabel("version 1.3.0")
+        self.ver_lbl = QLabel(self._t("version_label", v=APP_VERSION))
         self.ver_lbl.setObjectName("footer")
         self.ver_lbl.setFont(QFont("Segoe UI", 9))
         sb_lay.addWidget(self.ver_lbl)
         sb_lay.addStretch()
 
-        self.history_link = QPushButton("🕓  History")
+        self.history_link = QPushButton(self._t("history"))
         self.history_link.setObjectName("feedbackLink")
         self.history_link.setFont(QFont("Segoe UI", 9, QFont.Bold))
         self.history_link.setCursor(Qt.PointingHandCursor)
@@ -1162,224 +1545,146 @@ class YouTubeDownloader(QMainWindow):
 
         main.addWidget(status_bar)
 
-        # Apply saved preferences (default quality, subtitles) on launch
-        saved_quality = self.settings.get_default_quality()
-        idx = self.quality_combo.findText(saved_quality)
+        saved_quality_key = self.settings.get_default_quality()
+        idx = self.quality_combo.findData(saved_quality_key)
         if idx >= 0:
             self.quality_combo.setCurrentIndex(idx)
         self.sub_check.setChecked(self.settings.get_subtitles())
 
-        # Restore saved Video/Audio format
         saved_format = self.settings.get_default_format()
         self.toggle.set_mode(saved_format)
         self._on_format_change(saved_format)
 
-    # ── Stylesheet — Luxury dark & gold theme, MediaHuman-style list ───────
+    # ── Style ────────────────────────────────────────────────────────────────
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget#root { background: #121009; }
-            QWidget { font-family: 'Segoe UI', Arial, sans-serif; }
+        self.setStyleSheet(build_main_qss(self.theme))
+        self._refresh_icons()
 
-            QWidget#toolbar {
-                background: #17140D;
-                border-bottom: 1px solid #322A17;
-            }
-            QPushButton#pasteBtn {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #FFE27A, stop:1 #D4AF37);
-                color: #1A1608;
-                border: 2px solid #FFDD70;
-                border-radius: 10px;
-                padding: 0 16px;
-                font-weight: bold;
-            }
-            QPushButton#pasteBtn:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #FFEA96, stop:1 #E8CB5E);
-                border-color: #FFF0A8;
-            }
-            QPushButton#pasteBtn:pressed { background: #A9860F; border-color: #C9A227; }
-
-            QPushButton#headerSettingsBtn {
-                background: #211D14;
-                border: 1px solid #4A4128;
-                border-radius: 10px;
-                color: #E9DBAF;
-                padding: 0 14px;
-            }
-            QPushButton#headerSettingsBtn:hover { border-color: #D4AF37; }
-
-            QPushButton#dlAllBtn {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #C9A227, stop:0.5 #E8CB5E, stop:1 #C9A227);
-                color: #1A1608;
-                border: none;
-                border-radius: 10px;
-                padding: 0 14px;
-            }
-            QPushButton#dlAllBtn:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #D4AF37, stop:0.5 #F2D876, stop:1 #D4AF37);
-            }
-            QPushButton#dlAllBtn:disabled { background: #2A2618; color: #6E6553; }
-
-            QComboBox#qualityCombo {
-                background: #100E09;
-                border: 2px solid #362E1B;
-                border-radius: 8px;
-                padding: 2px 10px;
-                color: #F0E6C8;
-            }
-            QComboBox#qualityCombo::drop-down { border: none; width: 24px; }
-            QComboBox#qualityCombo QAbstractItemView {
-                background: #1A1610; color: #E9DBAF;
-                border: 2px solid #D4AF37;
-                selection-background-color: #3A3016;
-            }
-            QCheckBox#subCheck { color: #9A9075; }
-            QCheckBox#subCheck::indicator {
-                width: 15px; height: 15px;
-                border: 2px solid #4A4128; border-radius: 4px;
-                background: #100E09;
-            }
-            QCheckBox#subCheck::indicator:checked { background: #D4AF37; border-color: #D4AF37; }
-
-            QWidget#toggleContainer { background: #100E09; border: 1px solid #322A17; border-radius: 9px; }
-            QPushButton#toggleActive {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FFE27A, stop:1 #D4AF37);
-                color: #1A1608; border: none; border-radius: 7px; padding: 0 16px; font-weight: bold;
-            }
-            QPushButton#toggleInactive {
-                background: transparent; color: #6E6553; border: none; border-radius: 7px; padding: 0 16px;
-            }
-            QPushButton#toggleInactive:hover { color: #C9BE9E; }
-
-            /* ── Split view / integrated history panel ── */
-            QWidget#splitView { background: #121009; }
-            QWidget#historyPanel {
-                background: #17140D;
-                border-left: 1px solid #322A17;
-            }
-            QLabel#historyTitle { color: #F4E9C9; }
-            QPushButton#historyPanelCloseBtn {
-                background: #211D14; border: 1px solid #4A2820; border-radius: 12px; color: #D96C5F;
-            }
-            QPushButton#historyPanelCloseBtn:hover { border-color: #D96C5F; background: #2B1E1B; }
-            QListWidget#historyList {
-                background: #0A0904; color: #C9BE9E;
-                border: 1px solid #2A2618; border-radius: 10px; padding: 6px;
-                font-size: 10px;
-            }
-            QListWidget#historyList::item { padding: 6px 4px; border-bottom: 1px solid #201C15; }
-            QListWidget#historyList::item:selected { background: #2B2518; color: #F0E6C8; }
-            QPushButton#historyClearBtn {
-                background: #211D14; color: #D96C5F; border: 1px solid #4A2820; border-radius: 8px;
-                padding: 0 12px; font-weight: 600;
-            }
-            QPushButton#historyClearBtn:hover { border-color: #D96C5F; background: #2B1E1B; }
-            QPushButton#historyCloseBtn {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #C9A227, stop:0.5 #E8CB5E, stop:1 #C9A227);
-                color: #1A1608; border: none; border-radius: 8px; padding: 0 16px; font-weight: bold;
-            }
-            QPushButton#historyCloseBtn:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #D4AF37, stop:0.5 #F2D876, stop:1 #D4AF37);
-            }
-
-            /* ── Filter tabs ── */
-            QWidget#tabsBar { background: #14120C; border-bottom: 1px solid #2A2618; }
-            QPushButton#filterTabActive {
-                background: #2B2518; color: #E9DBAF;
-                border: 1px solid #4A4128; border-radius: 14px; padding: 0 14px;
-            }
-            QPushButton#filterTabInactive {
-                background: transparent; color: #8A8066;
-                border: 1px solid transparent; border-radius: 14px; padding: 0 14px;
-            }
-            QPushButton#filterTabInactive:hover { color: #D4AF37; border-color: #4A4128; }
-
-            /* ── Queue list ── */
-            QScrollArea#queueScroll { background: #121009; }
-            QWidget#queueContainer { background: #121009; }
-            QLabel#emptyHint { color: #5E5642; padding: 60px 20px; }
-
-            QWidget#queueRow { background: #17140D; border-bottom: 1px solid #241F14; }
-            QWidget#queueRow:hover { background: #1D1810; }
-            QLabel#rowThumb {
-                background: #26221A; border-radius: 8px; color: #D4AF37;
-            }
-            QLabel#rowTitle  { color: #F0E6C8; }
-            QLabel#rowStatus { color: #8A8066; }
-
-            QProgressBar#miniProgress { border: none; border-radius: 2px; background: #2A2618; }
-            QProgressBar#miniProgress::chunk { background: #D4AF37; border-radius: 2px; }
-
-            QPushButton#rowDownloadBtn {
-                background: #211D14; border: 1px solid #4A4128; border-radius: 15px; color: #D4AF37;
-            }
-            QPushButton#rowDownloadBtn:hover { border-color: #D4AF37; background: #2B2518; }
-            QPushButton#rowDownloadBtn:disabled { color: #4A4128; border-color: #241F14; }
-
-            QPushButton#rowFolderBtn {
-                background: #211D14; border: 1px solid #4A4128; border-radius: 15px; color: #E9DBAF;
-            }
-            QPushButton#rowFolderBtn:hover { border-color: #E9DBAF; background: #2B2518; }
-            QPushButton#rowFolderBtn:disabled { color: #4A4128; border-color: #241F14; }
-
-            QPushButton#rowRemoveBtn {
-                background: #211D14; border: 1px solid #4A2820; border-radius: 15px; color: #D96C5F;
-            }
-            QPushButton#rowRemoveBtn:hover { border-color: #D96C5F; background: #2B1E1B; }
-            QPushButton#rowRemoveBtn:disabled { color: #4A2820; border-color: #241F14; }
-
-            /* ── Status bar ── */
-            QWidget#statusBar { background: #17140D; border-top: 1px solid #322A17; }
-            QLabel#footer       { color: #5E5642; }
-            QPushButton#feedbackLink {
-                background: transparent; border: none; color: #D4AF37; padding: 0;
-            }
-            QPushButton#feedbackLink:hover { color: #F2D876; text-decoration: underline; }
-
-            QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }
-            QScrollBar::handle:vertical { background: #4A4128; border-radius: 3px; min-height: 30px; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        """)
+    def _refresh_icons(self):
+        """Vector icons are re-tinted whenever the theme changes."""
+        t, sz = self.theme, QSize(16, 16)
+        pairs = [
+            (self.paste_btn,           "plus",     t["on_accent"]),
+            (self.download_all_btn,    "download", t["on_accent"]),
+            (self.header_settings_btn, "gear",     t["text2"]),
+            (self.theme_btn,           "sun" if self.theme_name == "light" else "moon", t["text2"]),
+            (self.history_link,        "clock",    t["accent_text"]),
+        ]
+        for btn, name, col in pairs:
+            btn.setIcon(make_icon(name, col, 16))
+            btn.setIconSize(sz)
+        # Disabled "Download All" should look muted, not accent-coloured
+        self.download_all_btn.setIcon(make_icon("download", t["on_accent"], 16))
 
     # ── Paste-link → fetch-info → queue flow ────────────────────────────────
 
     def _paste_from_clipboard(self):
         clipboard = QApplication.clipboard()
         text = clipboard.text() or ""
-        urls = _YT_URL_RE.findall(text)
+        urls = _VIDEO_URL_RE.findall(text)
         if not urls:
-            QMessageBox.information(
-                self, "No Link Found",
-                "Copy a YouTube link to your clipboard first, then click \"Paste Link\"."
-            )
+            QMessageBox.information(self, self._t("no_link_title"), self._t("no_link_text"))
             return
         added = 0
+        expanding = 0
+        landed_pages = set()
         for raw_u in urls:
-            u = _clean_youtube_url(raw_u)
+            has_list, has_video = _youtube_list_info(raw_u)
+            if has_list:
+                # Pure playlist link -> always expand; video+list (e.g. a Mix) -> ask.
+                choice = self._ask_playlist_choice() if has_video else "all"
+                if choice == "cancel":
+                    continue
+                if choice == "all":
+                    self._start_playlist_expand(_clean_url(raw_u, keep_list=True))
+                    expanding += 1
+                    continue
+            u = _clean_url(raw_u)
             if not any(qi.url == u for qi in self.queue_items.values()):
-                self._add_queue_item(u)
+                landed_pages.add(self._add_queue_item(u))
                 added += 1
-        if added == 0:
-            self._flash_status("That link is already in your list.")
+        if added == 0 and expanding == 0:
+            self._flash_status(self._t("already_in_list"))
+        elif added:
+            elsewhere = [k for k in PAGE_KEYS if k in landed_pages and k != self.active_page]
+            if elsewhere:
+                names = ", ".join(PAGE_NAMES[k] for k in elsewhere)
+                self._flash_status(self._t("added_to_other_page", pages=names))
 
-    def _add_queue_item(self, url):
+    # ── Playlist / Mix support ───────────────────────────────────────────
+
+    def _ask_playlist_choice(self):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(self._t("playlist_title"))
+        box.setText(self._t("playlist_text", n=MAX_PLAYLIST_ITEMS))
+        all_btn = box.addButton(self._t("playlist_add_all"), QMessageBox.AcceptRole)
+        one_btn = box.addButton(self._t("playlist_add_one"), QMessageBox.NoRole)
+        box.addButton(self._t("btn_cancel"), QMessageBox.RejectRole)
+        box.setDefaultButton(all_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is all_btn:
+            return "all"
+        if clicked is one_btn:
+            return "one"
+        return "cancel"
+
+    def _start_playlist_expand(self, url):
+        self._flash_status(self._t("playlist_loading"), 6000)
+        worker = PlaylistWorker(url)
+        worker.entries_ready.connect(lambda entries, w=worker: self._on_playlist_ready(entries, w))
+        worker.error.connect(lambda msg, w=worker: self._on_playlist_error(msg, w))
+        self._playlist_workers.append(worker)
+        worker.start()
+
+    def _release_playlist_worker(self, worker):
+        if worker in self._playlist_workers:
+            self._playlist_workers.remove(worker)
+
+    def _on_playlist_ready(self, entries, worker):
+        self._release_playlist_worker(worker)
+        self._switch_page(PAGE_YOUTUBE)
+        added = 0
+        for e in entries:
+            u = _clean_url(e["url"])
+            if any(qi.url == u for qi in self.queue_items.values()):
+                continue
+            # Stagger the per-video info lookups so 50 requests don't fire at once
+            self._add_queue_item(u, title=e["title"], channel=e["channel"], delay_ms=added * 250)
+            added += 1
+        if added:
+            self._flash_status(self._t("playlist_added", n=added), 4000)
+        else:
+            self._flash_status(self._t("playlist_nothing_new"), 4000)
+
+    def _on_playlist_error(self, msg, worker):
+        self._release_playlist_worker(worker)
+        QMessageBox.warning(self, self._t("playlist_failed_title"), _clean_status_text(msg))
+
+    def _add_queue_item(self, url, title=None, channel="", delay_ms=0):
         item = QueueItem(url)
+        if title:
+            item.title = title
+        item.channel = channel
+        page_key = PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE)
         self.queue_items[item.id] = item
-        self.empty_hint.setVisible(False)
         row = QueueRowWidget(item)
         row.download_clicked.connect(self._download_single)
         row.remove_clicked.connect(self._remove_item)
         row.open_folder_clicked.connect(self._open_item_folder)
         self.row_widgets[item.id] = row
-        self.queue_list_lay.insertWidget(self.queue_list_lay.count() - 1, row)
+        container, list_lay, empty_hint = self.page_containers[page_key]
+        empty_hint.setVisible(False)
+        list_lay.insertWidget(list_lay.count() - 1, row)
         self._refresh_tabs_and_list()
-        self._fetch_item_info(item.id)
+        if delay_ms:
+            self._update_row(item.id)
+            QTimer.singleShot(delay_ms, lambda iid=item.id: self._fetch_item_info(iid))
+        else:
+            self._fetch_item_info(item.id)   # also re-renders the row with the live theme
+        return page_key
 
     def _fetch_item_info(self, item_id):
         item = self.queue_items.get(item_id)
@@ -1391,7 +1696,6 @@ class YouTubeDownloader(QMainWindow):
         worker = InfoWorker(item.url)
         worker.info_ready.connect(lambda info, iid=item_id: self._on_item_info_ready(iid, info))
         worker.error.connect(lambda msg, iid=item_id: self._on_item_info_error(iid, msg))
-        # Keep a reference so it isn't garbage-collected mid-flight
         item._info_worker = worker
         worker.start()
 
@@ -1399,11 +1703,11 @@ class YouTubeDownloader(QMainWindow):
         item = self.queue_items.get(item_id)
         if not item:
             return
-        item.title        = info["title"]
-        item.channel      = info["channel"]
-        item.duration     = info["duration"]
+        item.title         = info["title"]
+        item.channel       = info["channel"]
+        item.duration      = info["duration"]
         item.thumbnail_url = info.get("thumbnail") or ""
-        item.status       = QUEUE_STATUS_READY
+        item.status        = QUEUE_STATUS_READY
         self._update_row(item_id)
         self._refresh_tabs_and_list()
         if item.thumbnail_url:
@@ -1424,7 +1728,7 @@ class YouTubeDownloader(QMainWindow):
         worker.failed.connect(self._on_item_thumbnail_failed)
         item = self.queue_items.get(item_id)
         if item:
-            item._thumb_worker = worker  # keep a reference alive
+            item._thumb_worker = worker
         worker.start()
 
     def _on_item_thumbnail_ready(self, item_id, pixmap):
@@ -1437,8 +1741,6 @@ class YouTubeDownloader(QMainWindow):
             row.set_thumbnail_pixmap(pixmap)
 
     def _on_item_thumbnail_failed(self, item_id, msg):
-        # Keep the emoji fallback, but log why so it's easy to diagnose
-        # (network blocked, bad URL, non-image response, etc.)
         item = self.queue_items.get(item_id)
         url = item.thumbnail_url if item else "?"
         print(f"[thumbnail] item {item_id} failed to load ({url}): {msg}", file=sys.stderr)
@@ -1452,10 +1754,11 @@ class YouTubeDownloader(QMainWindow):
     def _remove_item(self, item_id):
         item = self.queue_items.get(item_id)
         if item and item.status == QUEUE_STATUS_PROCESSING:
-            return  # don't allow removing something actively downloading
+            return
         row = self.row_widgets.pop(item_id, None)
-        if row:
-            self.queue_list_lay.removeWidget(row)
+        if row and item:
+            page_key = PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE)
+            self.page_containers[page_key][1].removeWidget(row)
             row.deleteLater()
         self.queue_items.pop(item_id, None)
         if item_id in self.download_queue_ids:
@@ -1468,9 +1771,8 @@ class YouTubeDownloader(QMainWindow):
             self._open_in_explorer(item.output_dir)
 
     def _open_in_explorer(self, path):
-        """Open a folder in the OS's native file browser (Explorer/Finder/etc.)."""
         if not path or not os.path.exists(path):
-            QMessageBox.information(self, "Folder Not Found", "That download folder no longer exists.")
+            QMessageBox.information(self, self._t("folder_not_found_title"), self._t("folder_not_found_text"))
             return
         try:
             if sys.platform == "win32":
@@ -1480,7 +1782,7 @@ class YouTubeDownloader(QMainWindow):
             else:
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
-            QMessageBox.warning(self, "Couldn't Open Folder", f"Could not open the folder:\n{e}")
+            QMessageBox.warning(self, self._t("couldnt_open_folder_title"), self._t("couldnt_open_folder_text", e=e))
 
     def _persist_queue(self):
         entries = [
@@ -1495,6 +1797,21 @@ class YouTubeDownloader(QMainWindow):
             url = entry.get("url")
             if url and not any(qi.url == url for qi in self.queue_items.values()):
                 self._add_queue_item(url)
+
+    # ── Platform pages ───────────────────────────────────────────────────
+
+    def _switch_page(self, page_key):
+        if page_key not in PAGE_KEYS or page_key == self.active_page:
+            return
+        self.active_page = page_key
+        for k, btn in self.page_buttons.items():
+            btn.setObjectName("pageTabActive" if k == page_key else "pageTabInactive")
+            btn.setFont(QFont("Segoe UI", 10, QFont.Bold if k == page_key else QFont.Normal))
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        self.queue_scroll.takeWidget()
+        self.queue_scroll.setWidget(self.page_containers[page_key][0])
+        self._refresh_tabs_and_list()
 
     # ── Filter tabs ──────────────────────────────────────────────────────
 
@@ -1513,63 +1830,74 @@ class YouTubeDownloader(QMainWindow):
         return status == self.filter_mode
 
     def _refresh_tabs_and_list(self):
+        page_totals = {k: 0 for k in PAGE_KEYS}
+        for item in self.queue_items.values():
+            page_key = PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE)
+            page_totals[page_key] += 1
+        for key, btn in self.page_buttons.items():
+            btn.setText(_page_tab_text(key, page_totals[key]))
+
+        active = self.active_page
         counts = {"all": 0, "ready": 0, "processing": 0, "failed": 0, "skipped": 0, "complete": 0}
         for item in self.queue_items.values():
+            if PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE) != active:
+                continue
             counts["all"] += 1
             if item.status in counts:
                 counts[item.status] += 1
 
-        labels = {
-            "all": "All", "ready": "Ready", "processing": "Processing",
-            "failed": "Failed", "skipped": "Skipped", "complete": "Complete",
+        tr_keys = {
+            "all": "tab_all", "ready": "tab_ready", "processing": "tab_processing",
+            "failed": "tab_failed", "skipped": "tab_skipped", "complete": "tab_complete",
         }
         for key, btn in self.filter_buttons.items():
-            btn.setText(f"{labels[key]} ({counts[key]})")
+            btn.setText(f"{self._t(tr_keys[key])} ({counts[key]})")
 
-        any_visible = False
         for item_id, row in self.row_widgets.items():
             item = self.queue_items[item_id]
-            visible = self._status_matches_filter(item.status)
-            row.setVisible(visible)
-            any_visible = any_visible or visible
-        self.empty_hint.setVisible(len(self.queue_items) == 0)
+            if PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE) != active:
+                continue
+            row.setVisible(self._status_matches_filter(item.status))
+        self.page_containers[active][2].setVisible(page_totals[active] == 0)
 
         ready_count = counts["ready"]
-        self.download_all_btn.setText(f"⬇  Download All Ready ({ready_count})")
+        self.download_all_btn.setText(f"{self._t('download_all_ready')} ({ready_count})")
         self.download_all_btn.setEnabled(ready_count > 0)
 
         self._persist_queue()
 
-    def _flash_status(self, msg):
+    def _flash_status(self, msg, ms=2500):
         self.history_link.setText(msg)
-        QTimer.singleShot(2500, lambda: self.history_link.setText("🕓  History"))
+        QTimer.singleShot(ms, lambda: self.history_link.setText(
+            self._t("hide_history") if self.history_panel.isVisible() else self._t("history")))
 
     # ── Format / quality controls ───────────────────────────────────────
 
     def _on_format_change(self, mode):
         self.settings.set_default_format(mode)
         if mode == "audio":
-            self.quality_combo.setCurrentText("Audio Only")
+            idx = self.quality_combo.findData("audio_only")
+            if idx >= 0:
+                self.quality_combo.setCurrentIndex(idx)
             self.quality_combo.setEnabled(False)
         else:
             self.quality_combo.setEnabled(True)
-            if self.quality_combo.currentText() == "Audio Only":
+            if self.quality_combo.currentData() == "audio_only":
                 self.quality_combo.setCurrentIndex(0)
 
-    def _on_quality_change(self, text):
-        self.settings.set_default_quality(text)
+    def _on_quality_change(self, index):
+        key = self.quality_combo.itemData(index)
+        if key:
+            self.settings.set_default_quality(key)
 
     # ── Download (single item / all ready) ──────────────────────────────
 
     def _resolve_mode_quality(self):
         fmt = self.toggle.mode()
-        mode = "mp3" if (fmt == "audio" or self.quality_combo.currentText() == "Audio Only") else "mp4"
-        quality_map = {
-            "Best (4K)": "best", "1080p": "1080", "720p": "720",
-            "480p": "480", "360p": "360", "Audio Only": "best",
-        }
-        quality = quality_map.get(self.quality_combo.currentText(), "best")
-        return mode, quality, self.quality_combo.currentText()
+        key = self.quality_combo.currentData() or "best4k"
+        mode = "mp3" if (fmt == "audio" or key == "audio_only") else "mp4"
+        quality = QUALITY_TO_YTDLP.get(key, "best")
+        return mode, quality, key
 
     def _download_single(self, item_id):
         item = self.queue_items.get(item_id)
@@ -1580,7 +1908,11 @@ class YouTubeDownloader(QMainWindow):
         self._fill_download_slots()
 
     def _download_all_ready(self):
-        ready_ids = [qi.id for qi in self.queue_items.values() if qi.status == QUEUE_STATUS_READY]
+        ready_ids = [
+            qi.id for qi in self.queue_items.values()
+            if qi.status == QUEUE_STATUS_READY
+            and PLATFORM_TO_PAGE.get(qi.platform, PAGE_YOUTUBE) == self.active_page
+        ]
         if not ready_ids:
             return
         for iid in ready_ids:
@@ -1604,19 +1936,17 @@ class YouTubeDownloader(QMainWindow):
         output_dir = self.settings.get_audio_dir() if mode == "mp3" else self.settings.get_video_dir()
         os.makedirs(output_dir, exist_ok=True)
 
-        # Duplicate-file check
         existing = self._existing_matches(output_dir, item.title)
         if existing and item.status != QUEUE_STATUS_COMPLETE:
-            kind = "audio" if mode == "mp3" else "video"
             file_list = "\n".join(f"• {f}" for f in existing[:5])
-            more = f"\n…and {len(existing) - 5} more" if len(existing) > 5 else ""
+            more = "\n" + self._t("and_more", n=len(existing) - 5) if len(existing) > 5 else ""
             box = QMessageBox(self)
-            box.setWindowTitle("Already Downloaded")
+            box.setWindowTitle(self._t("already_downloaded_title"))
             box.setIcon(QMessageBox.Question)
-            box.setText(f"This {kind} already exists in your download folder:")
-            box.setInformativeText(f"{file_list}{more}\n\nDownload it again?")
-            yes_btn = box.addButton("Download Again", QMessageBox.YesRole)
-            no_btn  = box.addButton("Skip", QMessageBox.NoRole)
+            box.setText(self._t("already_downloaded_audio_text" if mode == "mp3" else "already_downloaded_video_text"))
+            box.setInformativeText(f"{file_list}{more}\n\n{self._t('confirm_download_again')}")
+            box.addButton(self._t("btn_download_again"), QMessageBox.YesRole)
+            no_btn = box.addButton(self._t("btn_skip"), QMessageBox.NoRole)
             box.setDefaultButton(no_btn)
             box.exec_()
             if box.clickedButton() is no_btn:
@@ -1634,8 +1964,6 @@ class YouTubeDownloader(QMainWindow):
         self._update_row(item_id)
         self._refresh_tabs_and_list()
 
-        # Reset the row's mini progress bar to a clean determinate 0% state
-        # before this download's signals start arriving.
         row = self.row_widgets.get(item_id)
         if row:
             row.mini_progress.setRange(0, 100)
@@ -1650,14 +1978,28 @@ class YouTubeDownloader(QMainWindow):
         self.workers[item_id] = worker
         worker.start()
 
+    def _progress_qss(self, chunk_color):
+        t = self.theme
+        return f"""
+            QProgressBar {{
+                background-color: {t['progress_bg']};
+                border: 1px solid {t['progress_border']};
+                border-radius: 9px;
+                color: {t['text']};
+                text-align: center;
+                font-weight: bold;
+                font-size: 10px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {chunk_color};
+                border-radius: 8px;
+            }}
+        """
+
     def _on_progress(self, item_id, pct, label):
         row = self.row_widgets.get(item_id)
         if not row:
             return
-
-        # Make sure we're in determinate mode (a prior "Processing…" state
-        # for a *different* download on this row could have left it
-        # indeterminate — guard against that here too).
         if row.mini_progress.maximum() == 0:
             row.mini_progress.setRange(0, 100)
 
@@ -1665,7 +2007,7 @@ class YouTubeDownloader(QMainWindow):
         row.mini_progress.setValue(int(pct_clamped))
         row.mini_progress.setFormat(f"{pct_clamped:.1f}%")
 
-        # Smooth red -> green color ramp as progress increases
+        # Smooth red -> green ramp
         colors = [
             "rgb(255,   0,  80)", "rgb(255,  32,  80)", "rgb(255,  64,  80)",
             "rgb(255,  96,  80)", "rgb(255, 128,  80)", "rgb(255, 160,  80)",
@@ -1676,50 +2018,20 @@ class YouTubeDownloader(QMainWindow):
             "rgb( 16, 255,  80)", "rgb(  8, 255,  80)", "rgb(  0, 255,  80)",
         ]
         index = min(int(pct_clamped / 5), len(colors) - 1)
-        color = colors[index]
-
-        row.mini_progress.setStyleSheet(f"""
-            QProgressBar {{
-                background-color: rgb(40, 40, 40);
-                border: 1px solid rgb(70, 70, 70);
-                border-radius: 8px;
-                color: white;
-                text-align: center;
-                font-weight: bold;
-                font-size: 10px;
-            }}
-            QProgressBar::chunk {{
-                background-color: {color};
-                border-radius: 7px;
-            }}
-        """)
+        row.mini_progress.setStyleSheet(self._progress_qss(colors[index]))
 
     def _on_processing(self, item_id):
         row = self.row_widgets.get(item_id)
         if not row:
             return
-        row.mini_progress.setRange(0, 0)   # indeterminate "still working" animation
-        row.mini_progress.setFormat("Processing…")
-        row.mini_progress.setStyleSheet("""
-            QProgressBar {
-                background-color: rgb(40, 40, 40);
-                border: 1px solid rgb(70, 70, 70);
-                border-radius: 8px;
-                color: white;
-                text-align: center;
-                font-weight: bold;
-                font-size: 10px;
-            }
-            QProgressBar::chunk {
-                background-color: #D4AF37;
-                border-radius: 7px;
-            }
-        """)
+        row.mini_progress.setRange(0, 0)
+        row.mini_progress.setFormat(self._t("progress_processing"))
+        row.mini_progress.setStyleSheet(self._progress_qss(self.theme['accent']))
 
     def _on_finished(self, item_id, msg):
         row = self.row_widgets.get(item_id)
         if row:
-            row.mini_progress.setRange(0, 100)   # leave indeterminate mode
+            row.mini_progress.setRange(0, 100)
             row.mini_progress.setValue(100)
             row.mini_progress.setFormat("100%")
         item = self.queue_items.get(item_id)
@@ -1729,6 +2041,8 @@ class YouTubeDownloader(QMainWindow):
             self.settings.add_history_entry({
                 "title": item.title,
                 "url": item.url,
+                "mode": item.mode,
+                "quality": item.quality,
                 "type": "Audio (MP3)" if item.mode == "mp3" else f"Video ({item.quality})",
                 "folder": item.output_dir,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1740,7 +2054,7 @@ class YouTubeDownloader(QMainWindow):
     def _on_error(self, item_id, msg):
         row = self.row_widgets.get(item_id)
         if row:
-            row.mini_progress.setRange(0, 100)   # leave indeterminate mode
+            row.mini_progress.setRange(0, 100)
         item = self.queue_items.get(item_id)
         if item:
             item.status = QUEUE_STATUS_FAILED
@@ -1753,32 +2067,88 @@ class YouTubeDownloader(QMainWindow):
     def _advance_download_queue(self):
         self._fill_download_slots()
 
-    # ── Settings / history dialogs ───────────────────────────────────────
+    # ── Theme ─────────────────────────────────────────────────────────────
+
+    def _apply_theme(self, name):
+        if name not in THEMES:
+            return
+        self.theme_name = name
+        self.theme = THEMES[name]
+        self.settings.set_theme(name)
+        self._apply_style()   # also re-tints the toolbar icons
+        for item_id in list(self.queue_items.keys()):
+            self._update_row(item_id)
+
+    def _toggle_theme(self):
+        self._apply_theme("light" if self.theme_name == "dark" else "dark")
+
+    # ── Language ──────────────────────────────────────────────────────────
+
+    def _apply_language(self, name):
+        if name not in TRANSLATIONS:
+            return
+        self.language = name
+        self.settings.set_language(name)
+        self._retranslate_ui()
+
+    def _retranslate_ui(self):
+        self.paste_btn.setText(self._t("paste_link"))
+        self.ver_lbl.setText(self._t("version_label", v=APP_VERSION))
+        self.toggle.set_labels(self._t("video"), self._t("audio"))
+        self.sub_check.setText(self._t("subtitles"))
+        self.theme_btn.setToolTip(self._t("theme_tooltip"))
+        self.header_settings_btn.setText(self._t("settings"))
+        empty_hint_keys = {PAGE_YOUTUBE: "empty_hint_youtube", PAGE_META: "empty_hint_meta", PAGE_TIKTOK: "empty_hint_tiktok"}
+        for key, (_, _, empty_hint) in self.page_containers.items():
+            empty_hint.setText(self._t(empty_hint_keys[key]))
+
+        current_key = self.quality_combo.currentData()
+        self.quality_combo.blockSignals(True)
+        self.quality_combo.clear()
+        for key in QUALITY_KEYS:
+            self.quality_combo.addItem(self._quality_label(key), key)
+        idx = self.quality_combo.findData(current_key)
+        if idx >= 0:
+            self.quality_combo.setCurrentIndex(idx)
+        self.quality_combo.blockSignals(False)
+
+        self.history_panel_title_lbl.setText(self._t("history_title"))
+        self.history_clear_btn.setText(self._t("history_clear"))
+        self.history_close_btn.setText(self._t("history_close"))
+        showing = self.history_panel.isVisible()
+        self.history_link.setText(self._t("hide_history") if showing else self._t("history"))
+        if showing:
+            self._refresh_history_list()
+
+        self._refresh_tabs_and_list()
+        for item_id in list(self.queue_items.keys()):
+            self._update_row(item_id)
+
+    # ── Settings / history ───────────────────────────────────────────────
 
     def _open_settings(self):
-        dlg = SettingsDialog(self.settings, self)
+        dlg = SettingsDialog(self.settings, self.theme, self.language, self)
         dlg.exec_()
 
     def _build_history_panel(self):
-        """Integrated Download History panel, styled to match the app theme,
-        docked to the right of the queue list instead of popping up."""
         panel = QWidget()
         panel.setObjectName("historyPanel")
-        panel.setFixedWidth(320)
+        panel.setAttribute(Qt.WA_StyledBackground, True)
+        panel.setFixedWidth(330)
 
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(16, 16, 16, 12)
         lay.setSpacing(10)
 
         header_row = QHBoxLayout()
-        title = QLabel("Download History")
-        title.setObjectName("historyTitle")
-        title.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        header_row.addWidget(title)
+        self.history_panel_title_lbl = QLabel(self._t("history_title"))
+        self.history_panel_title_lbl.setObjectName("historyTitle")
+        self.history_panel_title_lbl.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        header_row.addWidget(self.history_panel_title_lbl)
         header_row.addStretch()
         panel_close_btn = QPushButton("✕")
         panel_close_btn.setObjectName("historyPanelCloseBtn")
-        panel_close_btn.setFixedSize(24, 24)
+        panel_close_btn.setFixedSize(26, 26)
         panel_close_btn.setCursor(Qt.PointingHandCursor)
         panel_close_btn.clicked.connect(self._toggle_history_panel)
         header_row.addWidget(panel_close_btn)
@@ -1790,19 +2160,19 @@ class YouTubeDownloader(QMainWindow):
         lay.addWidget(self.history_list, stretch=1)
 
         btn_row = QHBoxLayout()
-        clear_btn = QPushButton("Clear History")
-        clear_btn.setObjectName("historyClearBtn")
-        clear_btn.setFixedHeight(34)
-        clear_btn.setCursor(Qt.PointingHandCursor)
-        clear_btn.clicked.connect(self._clear_history)
-        close_btn = QPushButton("Close")
-        close_btn.setObjectName("historyCloseBtn")
-        close_btn.setFixedHeight(34)
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.clicked.connect(self._toggle_history_panel)
-        btn_row.addWidget(clear_btn)
+        self.history_clear_btn = QPushButton(self._t("history_clear"))
+        self.history_clear_btn.setObjectName("historyClearBtn")
+        self.history_clear_btn.setFixedHeight(34)
+        self.history_clear_btn.setCursor(Qt.PointingHandCursor)
+        self.history_clear_btn.clicked.connect(self._clear_history)
+        self.history_close_btn = QPushButton(self._t("history_close"))
+        self.history_close_btn.setObjectName("historyCloseBtn")
+        self.history_close_btn.setFixedHeight(34)
+        self.history_close_btn.setCursor(Qt.PointingHandCursor)
+        self.history_close_btn.clicked.connect(self._toggle_history_panel)
+        btn_row.addWidget(self.history_clear_btn)
         btn_row.addStretch()
-        btn_row.addWidget(close_btn)
+        btn_row.addWidget(self.history_close_btn)
         lay.addLayout(btn_row)
 
         return panel
@@ -1812,31 +2182,43 @@ class YouTubeDownloader(QMainWindow):
         if showing:
             self._refresh_history_list()
         self.history_panel.setVisible(showing)
-        self.history_link.setText("🕓  Hide History" if showing else "🕓  History")
+        self.history_link.setText(self._t("hide_history") if showing else self._t("history"))
+
+    def _history_type_label(self, entry):
+        mode = entry.get("mode")
+        if not mode:
+            return entry.get("type", "")
+        if mode == "mp3":
+            return self._t("history_type_audio")
+        q = str(entry.get("quality", "best"))
+        q_label = self._t("quality_best") if q == "best" else f"{q}p"
+        return f"{self._t('history_type_video')} ({q_label})"
 
     def _refresh_history_list(self):
         self.history_list.clear()
         history = self.settings.load_history()
         if not history:
-            item = QListWidgetItem("No downloads yet.")
+            item = QListWidgetItem(self._t("history_empty"))
             item.setFlags(Qt.NoItemFlags)
             self.history_list.addItem(item)
             return
         for entry in history:
-            kind_icon = "🎵" if "Audio" in entry.get("type", "") else "🎬"
+            is_audio = entry.get("mode") == "mp3" or (
+                not entry.get("mode") and "Audio" in entry.get("type", "")
+            )
+            kind_icon = "♪" if is_audio else "▶"
             folder = entry.get("folder", "")
             display_text = (
                 f"{kind_icon}  {entry.get('title', 'Unknown')}\n"
-                f"     {entry.get('type', '')} • {entry.get('timestamp', '')}\n"
+                f"     {self._history_type_label(entry)} • {entry.get('timestamp', '')}\n"
                 f"     {folder}"
             )
             list_item = QListWidgetItem(display_text)
             list_item.setData(Qt.UserRole, folder)
-            list_item.setToolTip("Double-click to open folder")
+            list_item.setToolTip(self._t("history_tooltip_open"))
             self.history_list.addItem(list_item)
 
     def _open_history_item_folder(self, list_item):
-        """Open folder when item is double-clicked"""
         folder = list_item.data(Qt.UserRole)
         if folder:
             self._open_in_explorer(folder)
@@ -1846,7 +2228,7 @@ class YouTubeDownloader(QMainWindow):
         self._refresh_history_list()
 
     def _reload_history(self):
-        pass  # history now lives entirely in its own dialog, loaded on open
+        pass
 
 
 # ── Entry ──────────────────────────────────────────────────────────────────────
