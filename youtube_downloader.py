@@ -34,7 +34,7 @@ def resource_path(filename):
 
 # ── Quality options ──────────────────────────────────────────────────────────
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 QUALITY_KEYS = ["best4k", "1080p", "720p", "480p", "360p", "audio_only"]
 
@@ -458,6 +458,15 @@ TRANSLATIONS = {
         "codec_quality": "Best quality (AV1 / VP9) — needs a strong PC",
         "codec_balanced": "Balanced (VP9 first) — plays on more PCs",
         "codec_compat": "Smooth anywhere (H.264) — max 1080p on YouTube",
+        "empty_hint_fbpost": 'No Facebook post yet — click "Paste Link" and paste a post link. Every video in it is downloaded automatically.',
+        "post_loading": "Reading the Facebook post…",
+        "post_added": "Found {n} videos — downloading automatically",
+        "post_added_skipped": "Found {n} videos — {s} already in your folder were skipped",
+        "post_all_in_folder": "All {s} videos in that post are already in your folder.",
+        "post_nothing_new": "Those videos are already in your list.",
+        "post_failed_title": "Couldn't Load Post",
+        "post_login_needed": "Facebook wouldn't show this post. If it is private or in a group, put a cookies.txt exported from your logged-in browser next to the app and try again.",
+        "post_no_videos": "No videos were found in this post.",
     },
     "km": {
         "paste_link": "បិទភ្ជាប់តំណ",
@@ -557,6 +566,15 @@ TRANSLATIONS = {
         "codec_quality": "គុណភាពល្អបំផុត (AV1 / VP9) — ត្រូវការកុំព្យូទ័រខ្លាំង",
         "codec_balanced": "សមតុល្យ (VP9 មុន) — ចាក់បានលើកុំព្យូទ័រច្រើនជាង",
         "codec_compat": "រលូនគ្រប់កន្លែង (H.264) — អតិបរមា 1080p លើ YouTube",
+        "empty_hint_fbpost": 'មិនទាន់មានប៉ុស្តិ៍ Facebook នៅឡើយទេ — ចុច "បិទភ្ជាប់តំណ" ហើយបិទភ្ជាប់តំណប៉ុស្តិ៍។ វីដេអូទាំងអស់ក្នុងនោះនឹងត្រូវទាញយកដោយស្វ័យប្រវត្តិ។',
+        "post_loading": "កំពុងអានប៉ុស្តិ៍ Facebook…",
+        "post_added": "រកឃើញវីដេអូ {n} — កំពុងទាញយកដោយស្វ័យប្រវត្តិ",
+        "post_added_skipped": "រកឃើញវីដេអូ {n} — រំលង {s} ដែលមានក្នុងថតរួចហើយ",
+        "post_all_in_folder": "វីដេអូទាំង {s} ក្នុងប៉ុស្តិ៍នោះមានក្នុងថតរបស់អ្នករួចហើយ។",
+        "post_nothing_new": "វីដេអូទាំងនោះមានក្នុងបញ្ជីរបស់អ្នករួចហើយ។",
+        "post_failed_title": "មិនអាចផ្ទុកប៉ុស្តិ៍បានទេ",
+        "post_login_needed": "Facebook មិនបង្ហាញប៉ុស្តិ៍នេះទេ។ ប្រសិនបើវាជាឯកជន ឬនៅក្នុងក្រុម សូមដាក់ឯកសារ cookies.txt ដែលនាំចេញពីកម្មវិធីរុករកដែលបានចូលគណនី នៅក្បែរកម្មវិធី រួចព្យាយាមម្តងទៀត។",
+        "post_no_videos": "រកមិនឃើញវីដេអូក្នុងប៉ុស្តិ៍នេះទេ។",
     },
 }
 
@@ -915,6 +933,81 @@ class PlaylistWorker(QThread):
             except Exception as ex:
                 last_err = str(ex)
         self.error.emit(last_err or "Could not load the playlist.")
+
+
+class PostWorker(QThread):
+    """Reads a Facebook post link and lists every video in it (nothing is
+    downloaded). yt-dlp returns a post with several videos as a playlist and a
+    post with one video as a single video; both are handled."""
+    entries_ready = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self._log = _YDLLog()
+
+    @staticmethod
+    def _entry(e, fallback_url):
+        vid = str(e.get("id") or "")
+        if vid.isdigit():
+            url = f"https://www.facebook.com/video.php?v={vid}"   # one stable link per video
+        else:
+            url = e.get("webpage_url") or e.get("url") or fallback_url
+        thumbs = e.get("thumbnails") or []
+        thumb = e.get("thumbnail") or (thumbs[-1].get("url") if thumbs and isinstance(thumbs[-1], dict) else "")
+        return {
+            "url": url,
+            "id": vid,
+            "title": e.get("title") or e.get("fulltitle") or (f"Facebook video {vid}" if vid else url),
+            "channel": e.get("uploader") or e.get("channel") or "",
+            "duration": e.get("duration_string") or "?",
+            "thumbnail": thumb or "",
+            "max_height": InfoWorker._max_height(e),
+        }
+
+    @classmethod
+    def entries_from(cls, info, fallback_url):
+        """Video dicts from yt-dlp's result (playlist or single video), no duplicates."""
+        if not info:
+            return []
+        raw = info.get("entries")
+        items = [e for e in raw if e] if raw is not None else [info]
+        out, seen = [], set()
+        for e in items:
+            d = cls._entry(e, fallback_url)
+            if d["url"] in seen:
+                continue
+            seen.add(d["url"])
+            out.append(d)
+        return out
+
+    def run(self):
+        try:
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "noplaylist": False,
+                "extract_flat": "in_playlist",
+                "ignore_no_formats_error": True,
+                "logger": self._log,
+                "retries": 3,
+                "extractor_retries": 3,
+                "socket_timeout": 20,
+            }
+            cookie_file = resource_path("cookies.txt")
+            if os.path.exists(cookie_file):
+                opts["cookiefile"] = cookie_file
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+            entries = self.entries_from(info, self.url)
+            if entries:
+                self.entries_ready.emit(entries)
+            else:
+                self.error.emit("no_videos")
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class ThumbnailWorker(QThread):
@@ -1469,7 +1562,8 @@ PLATFORM_LABELS = {"youtube": "YouTube", "facebook": "Facebook",
 PAGE_YOUTUBE = "youtube"
 PAGE_META = "meta"
 PAGE_TIKTOK = "tiktok"
-PAGE_KEYS = [PAGE_YOUTUBE, PAGE_META, PAGE_TIKTOK]
+PAGE_FBPOST = "fbpost"      # Facebook post links: every video in the post, downloaded automatically
+PAGE_KEYS = [PAGE_YOUTUBE, PAGE_META, PAGE_FBPOST, PAGE_TIKTOK]
 
 PLATFORM_TO_PAGE = {
     "youtube": PAGE_YOUTUBE,
@@ -1479,7 +1573,29 @@ PLATFORM_TO_PAGE = {
 }
 
 PAGE_NAMES = {PAGE_YOUTUBE: "YouTube",
-              PAGE_META: "Facebook & Instagram", PAGE_TIKTOK: "TikTok"}
+              PAGE_META: "Facebook & Instagram",
+              PAGE_FBPOST: "Facebook Posts",
+              PAGE_TIKTOK: "TikTok"}
+
+EMPTY_HINT_KEYS = {PAGE_YOUTUBE: "empty_hint_youtube", PAGE_META: "empty_hint_meta",
+                   PAGE_FBPOST: "empty_hint_fbpost", PAGE_TIKTOK: "empty_hint_tiktok"}
+
+# Facebook links that point at a POST (which can hold several videos), as opposed
+# to a single video / reel / watch link.
+_FB_POST_RE = re.compile(
+    r"facebook\.com/(?:[^/?#]+/posts/|permalink\.php|story\.php|"
+    r"groups/[^/?#]+/(?:posts|permalink)/|share/p/)|pfbid",
+    re.IGNORECASE,
+)
+
+
+def _is_fb_post_url(url):
+    return bool(_FB_POST_RE.search(url or ""))
+
+
+def _item_page(item):
+    """The page (tab) an item belongs to."""
+    return getattr(item, "page", None) or PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE)
 
 
 def _page_tab_text(key, count):
@@ -1626,6 +1742,8 @@ class QueueItem:
         self.max_height = 0        # tallest video stream yt-dlp was offered
         self.format_warning = ""   # why formats are missing, if yt-dlp said so
         self.actual_quality = ""   # e.g. "2160p VP9" once downloaded
+        self.page = None           # which page (tab) the row lives on; None = by platform
+        self.auto_download = False # start downloading as soon as it is added
 
 
 class QueueRowWidget(QWidget):
@@ -1825,6 +1943,7 @@ class YouTubeDownloader(QMainWindow):
         self.workers = {}
         self.info_worker = None
         self._playlist_workers = []   # keep references so threads aren't GC'd
+        self._post_workers = []
         self._info_queue = []      # item ids waiting for a metadata lookup slot
         self._info_active = 0
         # (item_id, url) waiting for a thumbnail slot
@@ -2100,8 +2219,7 @@ class YouTubeDownloader(QMainWindow):
         self.queue_scroll.setFrameShape(QFrame.NoFrame)
         self.queue_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        empty_hint_keys = {PAGE_YOUTUBE: "empty_hint_youtube",
-                           PAGE_META: "empty_hint_meta", PAGE_TIKTOK: "empty_hint_tiktok"}
+        empty_hint_keys = EMPTY_HINT_KEYS
         self.page_containers = {}
         for key in PAGE_KEYS:
             container = QWidget()
@@ -2199,6 +2317,14 @@ class YouTubeDownloader(QMainWindow):
         expanding = 0
         landed_pages = set()
         for raw_u in urls:
+            # A Facebook POST link (or any Facebook link pasted while the
+            # Facebook Posts page is open): read every video in it and
+            # download them all automatically.
+            if _detect_platform(raw_u) == "facebook" and (
+                    _is_fb_post_url(raw_u) or self.active_page == PAGE_FBPOST):
+                self._start_post_expand(_clean_url(raw_u))
+                expanding += 1
+                continue
             has_list, has_video = _youtube_list_info(raw_u)
             if has_list:
                 # Pure playlist link -> always expand; video+list (e.g. a Mix) -> ask.
@@ -2257,6 +2383,71 @@ class YouTubeDownloader(QMainWindow):
     def _release_playlist_worker(self, worker):
         if worker in self._playlist_workers:
             self._playlist_workers.remove(worker)
+            self._park_worker(worker)
+
+    def _park_worker(self, worker):
+        """Keep a helper thread alive until it has really stopped — dropping the
+        last reference to a QThread that is still finishing crashes the app."""
+        if worker.isRunning():
+            self._retired_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self._release_retired(w))
+            if not worker.isRunning():
+                self._release_retired(worker)
+
+    # ── Facebook posts: every video in the post, downloaded automatically ──
+
+    def _start_post_expand(self, url):
+        self._flash_status(self._t("post_loading"), 8000)
+        worker = PostWorker(url)
+        worker.entries_ready.connect(
+            lambda entries, w=worker: self._on_post_ready(entries, w))
+        worker.error.connect(
+            lambda msg, w=worker: self._on_post_error(msg, w))
+        self._post_workers.append(worker)
+        worker.start()
+
+    def _release_post_worker(self, worker):
+        if worker in self._post_workers:
+            self._post_workers.remove(worker)
+            self._park_worker(worker)
+
+    def _on_post_ready(self, entries, worker):
+        self._release_post_worker(worker)
+        self._switch_page(PAGE_FBPOST)
+        mode = self._resolve_mode_quality()[0]
+        added = 0
+        skipped = 0
+        for e in entries:
+            u = _clean_url(e["url"])
+            if any(qi.url == u for qi in self.queue_items.values()):
+                continue
+            if self._title_already_downloaded(u, e["title"], mode):
+                skipped += 1   # that file is already in the folder
+                continue
+            self._add_queue_item(
+                u, title=e["title"], channel=e["channel"], page=PAGE_FBPOST,
+                prefilled=e, auto_download=True)
+            added += 1
+        if added and skipped:
+            self._flash_status(self._t("post_added_skipped", n=added, s=skipped), 5000)
+        elif added:
+            self._flash_status(self._t("post_added", n=added), 5000)
+        elif skipped:
+            self._flash_status(self._t("post_all_in_folder", s=skipped), 5000)
+        else:
+            self._flash_status(self._t("post_nothing_new"), 4000)
+
+    def _on_post_error(self, msg, worker):
+        self._release_post_worker(worker)
+        low = (msg or "").lower()
+        if msg == "no_videos":
+            text = self._t("post_no_videos")
+        elif any(k in low for k in ("login", "log in", "logged in", "cookies", "private",
+                                    "isn't available", "not available", "cannot parse")):
+            text = self._t("post_login_needed")
+        else:
+            text = _clean_status_text(msg)
+        QMessageBox.warning(self, self._t("post_failed_title"), text)
 
     def _on_playlist_ready(self, entries, worker):
         self._release_playlist_worker(worker)
@@ -2289,12 +2480,20 @@ class YouTubeDownloader(QMainWindow):
         QMessageBox.warning(self, self._t(
             "playlist_failed_title"), _clean_status_text(msg))
 
-    def _add_queue_item(self, url, title=None, channel="", delay_ms=0):
+    def _add_queue_item(self, url, title=None, channel="", delay_ms=0,
+                        page=None, prefilled=None, auto_download=False):
         item = QueueItem(url)
         if title:
             item.title = title
         item.channel = channel
-        page_key = PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE)
+        page_key = page if page in PAGE_KEYS else _item_page(item)
+        item.page = page_key
+        item.auto_download = auto_download
+        if prefilled:   # details already known (e.g. read from a Facebook post): no extra lookup
+            item.duration = prefilled.get("duration", "")
+            item.thumbnail_url = prefilled.get("thumbnail") or ""
+            item.max_height = prefilled.get("max_height") or 0
+            item.status = QUEUE_STATUS_READY
         self.queue_items[item.id] = item
         row = QueueRowWidget(item)
         row.download_clicked.connect(self._download_single)
@@ -2305,7 +2504,13 @@ class YouTubeDownloader(QMainWindow):
         empty_hint.setVisible(False)
         list_lay.insertWidget(list_lay.count() - 1, row)
         self._refresh_tabs_and_list()
-        if delay_ms:
+        if prefilled:
+            self._update_row(item.id)
+            if item.thumbnail_url:
+                self._fetch_item_thumbnail(item.id, item.thumbnail_url)
+            if auto_download:
+                self._queue_download(item.id)
+        elif delay_ms:
             self._update_row(item.id)
             QTimer.singleShot(
                 delay_ms, lambda iid=item.id: self._fetch_item_info(iid))
@@ -2447,7 +2652,7 @@ class YouTubeDownloader(QMainWindow):
             return
         row = self.row_widgets.pop(item_id, None)
         if row and item:
-            page_key = PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE)
+            page_key = _item_page(item)
             self.page_containers[page_key][1].removeWidget(row)
             row.deleteLater()
         if item:
@@ -2480,7 +2685,7 @@ class YouTubeDownloader(QMainWindow):
 
     def _persist_queue(self):
         entries = [
-            {"url": qi.url, "title": qi.title, "mode": qi.mode}
+            {"url": qi.url, "title": qi.title, "mode": qi.mode, "page": _item_page(qi)}
             for qi in self.queue_items.values()
             if qi.status != QUEUE_STATUS_COMPLETE
         ]
@@ -2490,7 +2695,7 @@ class YouTubeDownloader(QMainWindow):
         for entry in self.settings.load_queue():
             url = entry.get("url")
             if url and not any(qi.url == url for qi in self.queue_items.values()):
-                self._add_queue_item(url)
+                self._add_queue_item(url, page=entry.get("page"))
 
     # ── Platform pages ───────────────────────────────────────────────────
 
@@ -2530,7 +2735,7 @@ class YouTubeDownloader(QMainWindow):
     def _refresh_tabs_and_list(self):
         page_totals = {k: 0 for k in PAGE_KEYS}
         for item in self.queue_items.values():
-            page_key = PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE)
+            page_key = _item_page(item)
             page_totals[page_key] += 1
         for key, btn in self.page_buttons.items():
             btn.setText(_page_tab_text(key, page_totals[key]))
@@ -2539,7 +2744,7 @@ class YouTubeDownloader(QMainWindow):
         counts = {"all": 0, "ready": 0, "processing": 0,
                   "failed": 0, "skipped": 0, "complete": 0}
         for item in self.queue_items.values():
-            if PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE) != active:
+            if _item_page(item) != active:
                 continue
             counts["all"] += 1
             if item.status in counts:
@@ -2554,7 +2759,7 @@ class YouTubeDownloader(QMainWindow):
 
         for item_id, row in self.row_widgets.items():
             item = self.queue_items[item_id]
-            if PLATFORM_TO_PAGE.get(item.platform, PAGE_YOUTUBE) != active:
+            if _item_page(item) != active:
                 continue
             row.setVisible(self._status_matches_filter(item.status))
         self.page_containers[active][2].setVisible(page_totals[active] == 0)
@@ -2618,7 +2823,7 @@ class YouTubeDownloader(QMainWindow):
         ready_ids = [
             qi.id for qi in self.queue_items.values()
             if qi.status == QUEUE_STATUS_READY
-            and PLATFORM_TO_PAGE.get(qi.platform, PAGE_YOUTUBE) == self.active_page
+            and _item_page(qi) == self.active_page
         ]
         if not ready_ids:
             return
@@ -2840,8 +3045,7 @@ class YouTubeDownloader(QMainWindow):
         self.sub_check.setText(self._t("subtitles"))
         self.theme_btn.setToolTip(self._t("theme_tooltip"))
         self.header_settings_btn.setText(self._t("settings"))
-        empty_hint_keys = {PAGE_YOUTUBE: "empty_hint_youtube",
-                           PAGE_META: "empty_hint_meta", PAGE_TIKTOK: "empty_hint_tiktok"}
+        empty_hint_keys = EMPTY_HINT_KEYS
         for key, (_, _, empty_hint) in self.page_containers.items():
             empty_hint.setText(self._t(empty_hint_keys[key]))
 
